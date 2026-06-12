@@ -47,6 +47,9 @@ _PACK_CACHE_3x3 = _LRUPackCache()
 # and the bench clears this per-call to model per-batch repack cost.
 _PACK_CACHE_CBLOCKED: Dict = {}
 _PACK_CACHE_WINOGRAD_F4X3 = _LRUPackCache()
+# 3D conv weight pack — same LRU rationale as _PACK_CACHE (weights reused every
+# forward pass, so a whole model's 3D conv weights stay warm).
+_PACK_CACHE_3D = _LRUPackCache()
 
 
 def prepack_oihw_to_kmajor(w_oihw: torch.Tensor, block_k: int = BLOCK_K):
@@ -75,6 +78,39 @@ def get_or_make_weight_pack(w_oihw: torch.Tensor, block_k: int = BLOCK_K):
         return entry[1]
     item = prepack_oihw_to_kmajor(w_oihw, block_k)
     _PACK_CACHE.put(key, w_oihw, item)
+    return item
+
+
+def prepack_oidhw_to_kmajor(w_oidhw: torch.Tensor, block_k: int = BLOCK_K):
+    """Pack a [K_out, C, KD, KH, KW] weight into K-major [K_out, K_pad] where
+    K_pad = pad(C*KD*KH*KW, block_k). Trailing lanes are zero so the reduction
+    tail contributes 0 (the general kernel decodes c>=C there but masks the
+    input side too). 3D analog of prepack_oihw_to_kmajor."""
+    K_out, C, KD, KH, KW = w_oidhw.shape
+    K_red = C * KD * KH * KW
+    K_pad = ((K_red + block_k - 1) // block_k) * block_k
+    w_rs = w_oidhw.reshape(K_out, K_red)
+    if K_pad != K_red:
+        pad = torch.zeros(
+            (K_out, K_pad - K_red), device=w_oidhw.device, dtype=w_oidhw.dtype
+        )
+        w_rs = torch.cat([w_rs, pad], dim=1)
+    return w_rs.contiguous(), (K_out, K_pad)
+
+
+def get_or_make_weight_pack_3d(w_oidhw: torch.Tensor, block_k: int = BLOCK_K):
+    key = (
+        _storage_ptr(w_oidhw),
+        tuple(w_oidhw.shape),
+        w_oidhw.dtype,
+        block_k,
+        int(getattr(w_oidhw, "_version", 0)),
+    )
+    entry = _PACK_CACHE_3D.get(key)
+    if entry is not None:
+        return entry[1]
+    item = prepack_oidhw_to_kmajor(w_oidhw, block_k)
+    _PACK_CACHE_3D.put(key, w_oidhw, item)
     return item
 
 

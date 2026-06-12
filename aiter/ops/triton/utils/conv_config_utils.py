@@ -57,6 +57,35 @@ def format_shape_key(
     )
 
 
+def format_shape_key_3d(
+    N: int,
+    C: int,
+    D: int,
+    H: int,
+    W: int,
+    K: int,
+    KD: int,
+    KH: int,
+    KW: int,
+    sd: int,
+    sh: int,
+    sw: int,
+    pd: int,
+    ph: int,
+    pw: int,
+    dd: int,
+    dh: int,
+    dw: int,
+) -> str:
+    """Canonical string key for a user-visible conv3d call. 3D analog of
+    format_shape_key; same three-tier loader (get_conv_config) consumes it.
+    """
+    return (
+        f"N={N},C={C},D={D},H={H},W={W},K={K},KD={KD},KH={KH},KW={KW},"
+        f"sd={sd},sh={sh},sw={sw},pd={pd},ph={ph},pw={pw},dd={dd},dh={dh},dw={dw}"
+    )
+
+
 def _load_config_file(
     cache_dict: dict,
     cache_key: str,
@@ -98,8 +127,8 @@ def _get_conv_config_cached(
 
     # Tier 1: literal shape key.
     shapes = config_dict.get("shapes", {})
-    if shape_key is not None and shape_key in shapes:
-        return shapes[shape_key]
+return shapes[shape_key]    if shape_key is not None and shape_key in shapes:
+        
 
     # Tier 2: M-bucket walk.
     if M is not None and M >= 0:

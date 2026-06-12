@@ -37,6 +37,17 @@ def _out_hw(H, W, R, S, stride, padding, dilation):
     return P, Q
 
 
+def _out_dhw(D, H, W, KD, KH, KW, stride, padding, dilation):
+    """3D analog of _out_hw. stride/padding/dilation are length-3 (d, h, w)."""
+    sd, sh, sw = stride
+    pd, ph, pw = padding
+    dd, dh, dw = dilation
+    D_out = (D + 2 * pd - dd * (KD - 1) - 1) // sd + 1
+    P = (H + 2 * ph - dh * (KH - 1) - 1) // sh + 1
+    Q = (W + 2 * pw - dw * (KW - 1) - 1) // sw + 1
+    return D_out, P, Q
+
+
 def _storage_ptr(t: torch.Tensor) -> int:
     return (
         t.untyped_storage().data_ptr()
@@ -53,6 +64,16 @@ def _is_1x1_conv(R, S, dilation):
 def _is_3x3_conv(R, S):
     """Check if this is a 3x3 convolution."""
     return R == 3 and S == 3
+
+
+def _is_1x1x1_conv(KD, KH, KW, dilation):
+    """Check if this is a 1x1x1 convolution (no spatial reduction in kernel)."""
+    return KD == 1 and KH == 1 and KW == 1 and dilation == (1, 1, 1)
+
+
+def _is_3x3x3_conv(KD, KH, KW):
+    """Check if this is a 3x3x3 convolution."""
+    return KD == 3 and KH == 3 and KW == 3
 
 
 def _is_winograd_eligible(R, S, stride, dilation, C=None):

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+
 import torch
 
 try:
@@ -10,8 +12,16 @@ except Exception:
     triton = None
     tl = None
 
-from aiter.ops.triton.conv._utils import _out_hw, _is_winograd_eligible
-from aiter.ops.triton.utils.conv_config_utils import format_shape_key
+from aiter.ops.triton.conv._utils import (
+    _out_hw,
+    _is_winograd_eligible,
+    _is_1x1x1_conv,
+    _is_3x3x3_conv,
+)
+from aiter.ops.triton.utils.conv_config_utils import (
+    format_shape_key,
+    format_shape_key_3d,
+)
 from aiter.ops.triton._triton_kernels.conv.conv_1x1 import (
     _conv2d_1x1_kernel,
     _get_config as _get_config_1x1,
@@ -36,6 +46,10 @@ from aiter.ops.triton._triton_kernels.conv.conv_3x3_winograd_f4x3 import (
     _get_config_gemm as _get_config_wino_gemm,
     _get_config_output as _get_config_wino_output,
     _get_config_fused as _get_config_wino_fused,
+)
+from aiter.ops.triton._triton_kernels.conv.conv3d_general import (
+    _conv3d_general_kernel,
+    _get_config as _get_config_general_3d,
 )
 
 
@@ -693,4 +707,136 @@ def _launch_winograd_f4x3_cblocked(
         HAS_BIAS=1 if bias_fp32 is not None else 0,
         ACTIVATION=activation,
         **output_config,
+    )
+
+
+# -- 3D convolution -----------------------------------------------------------
+
+# Phase 1 ships only the general 3D kernel. The router already returns the
+# specialized names so 1x1x1 / 3x3x3 wiring is live, but they are gated behind
+# this flag (default off) until those kernels land — when off, the specialized
+# names collapse to "general" at the call site. See conv/DESIGN.md routing.
+_CONV3D_SPECIALIZED_ENABLED = os.environ.get(
+    "AITER_TRITON_CONV3D_SPECIALIZED", "0"
+).lower() in ("1", "true", "yes", "on")
+
+
+def _select_conv3d_method(N, C, D, H, W, K_out, KD, KH, KW, stride, dilation):
+    """Pick the best 3D conv kernel for a shape.
+
+    Phase 1: returns "1x1x1" / "3x3x3" / "general" so the dispatch tree is
+    exercised, but only "general" has a kernel today. conv3d_ncdhw / _ndhwc
+    fall back to general for the specialized names unless the kernels exist
+    (gated by AITER_TRITON_CONV3D_SPECIALIZED). Thresholds (channel/tile-count
+    cutoffs like the 2D _select_3x3_method) will be added with the 3x3x3 kernel.
+    """
+    if _is_1x1x1_conv(KD, KH, KW, dilation):
+        return "1x1x1"
+    if _is_3x3x3_conv(KD, KH, KW):
+        return "3x3x3"
+    return "general"
+
+
+def specialized_enabled() -> bool:
+    return _CONV3D_SPECIALIZED_ENABLED
+
+
+def _launch_conv3d_general(
+    x,
+    w_k,
+    bias_fp32,
+    y,
+    N,
+    C,
+    D,
+    H,
+    W_in,
+    K_out,
+    KD,
+    KH,
+    KW,
+    D_out,
+    P,
+    Q,
+    K_pad,
+    stride,
+    padding,
+    dilation,
+    block_k,
+    activation,
+    layout="ncdhw",
+):
+    """Launch the general 3D conv kernel. layout: 'ncdhw' or 'ndhwc'."""
+    if triton is None:
+        raise RuntimeError("Triton not available")
+
+    sd, sh, sw = stride
+    pd, ph, pw = padding
+    dd, dh, dw = dilation
+    # LAYOUT travels to the kernel as a string constexpr ("ncdhw"/"ndhwc"),
+    # matching conv2d and the ACTIVATION style. Validated at the conv3d() entry.
+
+    def grid(meta):
+        BM = meta["BLOCK_M"]
+        BN = meta["BLOCK_N"]
+        return (triton.cdiv(N * D_out * P * Q, BM) * triton.cdiv(K_out, BN),)
+
+    bias_arg = bias_fp32 if bias_fp32 is not None else w_k.new_empty(1)
+
+    M_total = N * D_out * P * Q
+
+    shape_key = format_shape_key_3d(
+        N=N,
+        C=C,
+        D=D,
+        H=H,
+        W=W_in,
+        K=K_out,
+        KD=KD,
+        KH=KH,
+        KW=KW,
+        sd=sd,
+        sh=sh,
+        sw=sw,
+        pd=pd,
+        ph=ph,
+        pw=pw,
+        dd=dd,
+        dh=dh,
+        dw=dw,
+    )
+    config = _get_config_general_3d(shape_key=shape_key, M=M_total)
+
+    _conv3d_general_kernel[grid](
+        x,
+        w_k,
+        bias_arg,
+        y,
+        N,
+        C,
+        D,
+        H,
+        W_in,
+        K_out,
+        KD,
+        KH,
+        KW,
+        D_out,
+        P,
+        Q,
+        K_pad,
+        sd,
+        sh,
+        sw,
+        pd,
+        ph,
+        pw,
+        dd,
+        dh,
+        dw,
+        M_total,
+        HAS_BIAS=1 if bias_fp32 is not None else 0,
+        ACTIVATION=activation,
+        LAYOUT=layout,
+        **config,
     )
