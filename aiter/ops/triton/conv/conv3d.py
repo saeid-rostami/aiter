@@ -10,17 +10,21 @@ from aiter.ops.triton.conv._utils import (
     _out_dhw,
     _is_1x1x1_conv,
     _is_3x3x3_conv,
+    _is_winograd3d_eligible,
 )
 from aiter.ops.triton.conv._prepack import (
     get_or_make_weight_pack_3d,
     get_or_make_weight_pack_3x3x3,
     get_or_make_input_pack_cblocked_3d,
+    get_or_make_winograd3d_filter_f2x3,
 )
 from aiter.ops.triton.conv._launch import (
     _launch_conv3d_general,
     _launch_conv3d_1x1x1,
     _launch_conv3d_3x3x3_ndhwc,
     _launch_conv3d_3x3x3_cblocked,
+    _launch_winograd3d_f2x3,
+    _launch_winograd3d_f2x3_cblocked,
     _select_conv3d_method,
     conv3d_method_implemented,
 )
@@ -195,6 +199,89 @@ def conv3d_1x1x1(
     return y
 
 
+def conv3d_winograd_f2x3(
+    x,
+    w_oidhw,
+    bias=None,
+    stride=(1, 1, 1),
+    padding=(0, 0, 0),
+    dilation=(1, 1, 1),
+    activation="none",
+    block_k=BLOCK_K,
+    layout="ncdhw",
+):
+    """NCDHW/NDHWC conv3d via 3D Winograd F(2x2x2, 3x3x3) (experimental).
+    Reads the input layout directly (no channel-block repack). Output dtype matches
+    the input. Raises ValueError for non-eligible (non-3x3x3 / strided / dilated)."""
+    assert x.is_cuda and w_oidhw.is_cuda
+    if layout == "ndhwc":
+        x = x.to(memory_format=torch.channels_last_3d)
+    N, C, D, H, W_in = x.shape
+    K_out, Cw, KD, KH, KW = w_oidhw.shape
+    assert Cw == C, f"weight C ({Cw}) != input C ({C})"
+    if not _is_winograd3d_eligible(KD, KH, KW, stride, dilation, C):
+        raise ValueError(
+            "conv3d_winograd_f2x3 requires a 3x3x3 kernel with stride=1, dilation=1, "
+            f"C>=4, got {KD}x{KH}x{KW} stride={stride} dilation={dilation} C={C}"
+        )
+    D_out, P, Q = _out_dhw(D, H, W_in, KD, KH, KW, stride, padding, dilation)
+
+    if layout == "ndhwc":
+        y = torch.empty(
+            (N, K_out, D_out, P, Q),
+            device=x.device,
+            dtype=x.dtype,
+            memory_format=torch.channels_last_3d,
+        )
+    else:
+        y = torch.empty((N, K_out, D_out, P, Q), device=x.device, dtype=x.dtype)
+    bias_fp32 = bias.float().contiguous() if bias is not None else None
+    U, (_, C_pad) = get_or_make_winograd3d_filter_f2x3(w_oidhw.contiguous(), block_k)
+    _launch_winograd3d_f2x3(
+        x, U, bias_fp32, y,
+        N, C, D, H, W_in, K_out, D_out, P, Q, C_pad,
+        padding, activation, layout=layout,
+    )
+    return y
+
+
+def conv3d_winograd_f2x3_cblocked(
+    x,
+    w_oidhw,
+    bias=None,
+    stride=(1, 1, 1),
+    padding=(0, 0, 0),
+    dilation=(1, 1, 1),
+    activation="none",
+    block_k=BLOCK_K,
+):
+    """NCDHW conv3d via 3D Winograd F(2x2x2,3x3x3) with NCDHWc input packing for
+    coalesced channel loads; writes NCDHW-contiguous output (experimental)."""
+    assert x.is_cuda and w_oidhw.is_cuda
+    N, C, D, H, W_in = x.shape
+    K_out, Cw, KD, KH, KW = w_oidhw.shape
+    assert Cw == C, f"weight C ({Cw}) != input C ({C})"
+    if not _is_winograd3d_eligible(KD, KH, KW, stride, dilation, C):
+        raise ValueError(
+            "conv3d_winograd_f2x3_cblocked requires a 3x3x3 kernel with stride=1, "
+            f"dilation=1, C>=4, got {KD}x{KH}x{KW} stride={stride} dilation={dilation}"
+        )
+    D_out, P, Q = _out_dhw(D, H, W_in, KD, KH, KW, stride, padding, dilation)
+
+    y = torch.empty((N, K_out, D_out, P, Q), device=x.device, dtype=x.dtype)
+    bias_fp32 = bias.float().contiguous() if bias is not None else None
+    U, (_, C_pad) = get_or_make_winograd3d_filter_f2x3(w_oidhw.contiguous(), block_k)
+    Cb = block_k
+    x_blocked, C_pad_x = get_or_make_input_pack_cblocked_3d(x, Cb)
+    assert C_pad_x == C_pad, f"channel padding mismatch: input {C_pad_x} vs weight {C_pad}"
+    _launch_winograd3d_f2x3_cblocked(
+        x_blocked, Cb, U, bias_fp32, y,
+        N, C, D, H, W_in, K_out, D_out, P, Q, C_pad,
+        padding, activation,
+    )
+    return y
+
+
 def conv3d_ncdhw_cblocked(
     x,
     w_oidhw,
@@ -333,6 +420,11 @@ def conv3d_ncdhw(
             x, w_oidhw, bias, stride, padding, dilation, activation, block_k,
             layout="ncdhw",
         )
+    elif method == "winograd_f2x3":
+        _last_triton_kernel = "_winograd3d_f2x3_cblocked_* (fused: input+gemm/output)"
+        return conv3d_winograd_f2x3_cblocked(
+            x, w_oidhw, bias, stride, padding, dilation, activation, block_k
+        )
     elif method == "3x3x3":
         _last_triton_kernel = "_conv3d_3x3x3_cblocked_kernel"
         return conv3d_ncdhw_cblocked(
@@ -385,6 +477,12 @@ def conv3d_ndhwc(
     if method == "1x1x1":
         _last_triton_kernel = "_conv3d_1x1x1_kernel"
         return conv3d_1x1x1(
+            x, w_oidhw, bias, stride, padding, dilation, activation, block_k,
+            layout="ndhwc",
+        )
+    elif method == "winograd_f2x3":
+        _last_triton_kernel = "_winograd3d_f2x3_* ndhwc (fused: input+gemm/output)"
+        return conv3d_winograd_f2x3(
             x, w_oidhw, bias, stride, padding, dilation, activation, block_k,
             layout="ndhwc",
         )

@@ -9,10 +9,13 @@ from .helpers import CONV_AUTOTUNE_ENABLED
 from ..activation import _relu, _relu6, _gelu_tanh
 
 
-def _get_config(shape_key=None, M=None):
+def _get_config(shape_key=None, M=None, layout="ncdhw"):
+    # NCDHW and NDHWC gather the reduction (C·KD·KH·KW) along opposite contiguous
+    # axes, so they want different tilings -> separate config files.
     if CONV_AUTOTUNE_ENABLED:
         return {}
-    return get_conv_config("CONV3D-GENERAL", shape_key=shape_key, M=M)
+    name = "CONV3D-GENERAL-NDHWC" if layout == "ndhwc" else "CONV3D-GENERAL"
+    return get_conv_config(name, shape_key=shape_key, M=M)
 
 
 _conv3d_general_kernel_repr = make_kernel_repr(

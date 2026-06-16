@@ -41,6 +41,9 @@ def _build_matrix():
         for method in ORDERED_METHODS:
             matrix.append(((dtype, "ncdhw", method), f"{dtype_id}_ncdhw_{method}"))
         matrix.append(((dtype, "ndhwc", "default"), f"{dtype_id}_ndhwc"))
+        # Explicit NDHWC general-kernel coverage (bypasses the router; see
+        # run_all_methods' ndhwc branch handling of method="general").
+        matrix.append(((dtype, "ndhwc", "general"), f"{dtype_id}_ndhwc_general"))
     return matrix
 
 

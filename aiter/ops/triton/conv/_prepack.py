@@ -6,7 +6,11 @@ from collections import OrderedDict
 from typing import Dict
 import torch
 
-from aiter.ops.triton.conv._utils import BLOCK_K, _storage_ptr
+from aiter.ops.triton.conv._utils import (
+    BLOCK_K,
+    _storage_ptr,
+    winograd3d_filter_matrix,
+)
 
 _PACK_CACHE_MAXSIZE = int(os.environ.get("AITER_TRITON_CONV_PACK_CACHE_SIZE", "256"))
 
@@ -53,6 +57,8 @@ _PACK_CACHE_3D = _LRUPackCache()
 _PACK_CACHE_3x3x3_3D = _LRUPackCache()
 # 3D input pack — single-entry dict by design (unique per call), like _PACK_CACHE_CBLOCKED.
 _PACK_CACHE_CBLOCKED_3D: Dict = {}
+# 3D Winograd F(2x2x2,3x3x3) filter packs — LRU (weights reused every forward pass).
+_PACK_CACHE_WINOGRAD3D_F2X3 = _LRUPackCache()
 
 
 def prepack_oihw_to_kmajor(w_oihw: torch.Tensor, block_k: int = BLOCK_K):
@@ -291,6 +297,40 @@ def prepack_winograd_filter_f4x3(w_oihw: torch.Tensor, block_c: int = BLOCK_K):
         )
         u = torch.cat([u, pad], dim=2)
     return u.to(w_oihw.dtype).contiguous(), (K_out, C_pad)
+
+
+def prepack_winograd3d_filter_f2x3(w_oidhw: torch.Tensor, block_c: int = BLOCK_K):
+    """Transform 3x3x3 filters for 3D Winograd F(2x2x2,3x3x3): U = (G(x)G(x)G) g.
+    Input: [K_out, C, 3, 3, 3].  Output: [64, K_out, C_pad] (same dtype as input)."""
+    K_out, C, KD, KH, KW = w_oidhw.shape
+    assert KD == 3 and KH == 3 and KW == 3
+    C_pad = ((C + block_c - 1) // block_c) * block_c
+    GGG = winograd3d_filter_matrix(w_oidhw.device)  # [64, 27] fp32
+    g = w_oidhw.float().reshape(K_out, C, 27)  # [K_out, C, 27]
+    # U[a, k, c] = sum_i GGG[a, i] * g[k, c, i]
+    u = torch.einsum("ai,kci->akc", GGG, g).contiguous()  # [64, K_out, C]
+    if C_pad != C:
+        pad = torch.zeros(
+            (64, K_out, C_pad - C), device=w_oidhw.device, dtype=torch.float32
+        )
+        u = torch.cat([u, pad], dim=2)
+    return u.to(w_oidhw.dtype).contiguous(), (K_out, C_pad)
+
+
+def get_or_make_winograd3d_filter_f2x3(w_oidhw: torch.Tensor, block_c: int = BLOCK_K):
+    key = (
+        _storage_ptr(w_oidhw),
+        tuple(w_oidhw.shape),
+        w_oidhw.dtype,
+        block_c,
+        int(getattr(w_oidhw, "_version", 0)),
+    )
+    cached = _PACK_CACHE_WINOGRAD3D_F2X3.get(key)
+    if cached is not None:
+        return cached[1]
+    item = prepack_winograd3d_filter_f2x3(w_oidhw, block_c)
+    _PACK_CACHE_WINOGRAD3D_F2X3.put(key, w_oidhw, item)
+    return item
 
 
 def get_or_make_winograd_filter_f4x3(w_oihw: torch.Tensor, block_c: int = BLOCK_K):

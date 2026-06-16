@@ -22,16 +22,21 @@ import torch.nn.functional as F
 
 from aiter.ops.triton.conv._utils import (
     dynamic_conv_tolerances,
+    _winograd3d_tolerances,
     _out_dhw,
     _is_1x1x1_conv,
     _is_3x3x3_conv,
+    _is_winograd3d_eligible,
     apply_activation,
 )
 from aiter.ops.triton.conv.conv3d import (
     conv3d_ncdhw,
     conv3d_ndhwc,
+    conv3d_general,
     conv3d_1x1x1,
     conv3d_ncdhw_cblocked,
+    conv3d_winograd_f2x3,
+    conv3d_winograd_f2x3_cblocked,
 )
 
 # -- Architecture gating ------------------------------------------------------
@@ -57,11 +62,29 @@ def _3x3x3_guard(KD, KH, KW, stride, dilation, C):
     return _is_3x3x3_conv(KD, KH, KW)
 
 
+def _winograd3d_guard(KD, KH, KW, stride, dilation, C):
+    return _is_winograd3d_eligible(KD, KH, KW, stride, dilation, C)
+
+
 METHOD_REGISTRY = {
     "default": MethodEntry(conv3d_ncdhw, None, False, "", "default"),
+    # Forces the Phase-1 general (implicit-GEMM) kernel directly, bypassing the
+    # router, so its correctness is covered independent of routing decisions. No
+    # guard: the general kernel handles every kernel size / stride / dilation.
+    "general": MethodEntry(conv3d_general, None, False, "[general]", "general"),
     "1x1x1": MethodEntry(conv3d_1x1x1, _1x1x1_guard, False, "[1x1x1]", "1x1x1"),
     "cblocked": MethodEntry(
         conv3d_ncdhw_cblocked, _3x3x3_guard, False, "[cblocked]", "cblocked"
+    ),
+    "winograd_f2x3": MethodEntry(
+        conv3d_winograd_f2x3, _winograd3d_guard, True, "[wino3d]", "winograd_f2x3"
+    ),
+    "winograd_f2x3_cblocked": MethodEntry(
+        conv3d_winograd_f2x3_cblocked,
+        _winograd3d_guard,
+        True,
+        "[wino3d_cb]",
+        "winograd_f2x3_cblocked",
     ),
 }
 
@@ -182,24 +205,44 @@ def run_all_methods(
                 dilation,
                 activation=activation,
             )
-            suite.check_close(
-                f"{name} {entry.bench_tag or '[NCDHW]'}",
-                y_tri,
-                y_ref,
-                K_red=K_red,
-            )
+            if entry.is_winograd:
+                rtol, atol = _winograd3d_tolerances(suite.dtype, K_red, y_ref.float())
+                suite.check_close(
+                    f"{name} {entry.bench_tag or '[NCDHW]'}",
+                    y_tri, y_ref, K_red=K_red, rtol=rtol, atol=atol,
+                )
+            else:
+                suite.check_close(
+                    f"{name} {entry.bench_tag or '[NCDHW]'}",
+                    y_tri,
+                    y_ref,
+                    K_red=K_red,
+                )
 
     if suite.layout_mode in ("ndhwc", "both"):
-        y_ndhwc = conv3d_ndhwc(
-            x,
-            w,
-            b,
-            stride,
-            padding,
-            dilation,
-            activation=activation,
-        )
-        suite.check_close(f"{name} [NDHWC]", y_ndhwc, y_ref, K_red=K_red)
+        # method="general" forces the general kernel directly in NDHWC (bypassing the
+        # router); any other method exercises the NDHWC router (conv3d_ndhwc).
+        if method == "general":
+            # conv3d_general(layout="ndhwc") expects a channels-last input (the
+            # production conv3d_ndhwc converts before delegating); mirror that here.
+            x_cl = x.to(memory_format=torch.channels_last_3d)
+            y_ndhwc = conv3d_general(
+                x_cl, w, b, stride, padding, dilation,
+                activation=activation, layout="ndhwc",
+            )
+            tag = f"{name} [NDHWC general]"
+        else:
+            y_ndhwc = conv3d_ndhwc(
+                x,
+                w,
+                b,
+                stride,
+                padding,
+                dilation,
+                activation=activation,
+            )
+            tag = f"{name} [NDHWC]"
+        suite.check_close(tag, y_ndhwc, y_ref, K_red=K_red)
 
 
 # -- Shape sets ---------------------------------------------------------------

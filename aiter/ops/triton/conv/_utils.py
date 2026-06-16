@@ -98,6 +98,95 @@ def _winograd_tolerances(dtype, K_red, ref, variant="f4x3"):
     return rtol, atol
 
 
+def _is_winograd3d_eligible(KD, KH, KW, stride, dilation, C=None):
+    """Eligibility for 3D Winograd F(2x2x2, 3x3x3): 3x3x3, unit stride/dilation."""
+    if not (
+        KD == 3
+        and KH == 3
+        and KW == 3
+        and stride == (1, 1, 1)
+        and dilation == (1, 1, 1)
+    ):
+        return False
+    if C is not None and C < 4:
+        return False
+    return True
+
+
+def _winograd3d_tolerances(dtype, K_red, ref, variant="f2x3"):
+    """Return (rtol, atol) for 3D Winograd F(2x2x2,3x3x3) correctness checks.
+
+    F(2,3) transform matrices (B^T, A^T) are pure {-1,0,1}, so the data/output
+    transforms add no rounding beyond the fp32 accumulation. The extra error vs a
+    direct conv comes from (a) the fp32->fp16 round of the per-tile GEMM result M
+    and (b) the filter transform G (entries up to 0.5) done in fp32 on the host.
+    A modest tolerance bump (vs the direct 3x3x3 path) absorbs that.
+    """
+    rtol, atol = dynamic_conv_tolerances(dtype, K_red, ref)
+    if variant == "f2x3":
+        rtol *= 3.0
+        atol = max(atol * 3.0, 0.3)
+    return rtol, atol
+
+
+# --- 3D Winograd F(2x2x2, 3x3x3) transform matrices --------------------------
+# F(2,3) 1-D matrices (Winograd):
+#   B^T (4x4) data transform, A^T (2x4) output transform, G (4x3) filter transform.
+# The 3-D transforms are the Kronecker (separable) products applied on (d, h, w).
+_WINO3D_BT = [
+    [1.0, 0.0, -1.0, 0.0],
+    [0.0, 1.0, 1.0, 0.0],
+    [0.0, -1.0, 1.0, 0.0],
+    [0.0, 1.0, 0.0, -1.0],
+]
+_WINO3D_AT = [
+    [1.0, 1.0, 1.0, 0.0],
+    [0.0, 1.0, -1.0, -1.0],
+]
+_WINO3D_G = [
+    [1.0, 0.0, 0.0],
+    [0.5, 0.5, 0.5],
+    [0.5, -0.5, 0.5],
+    [0.0, 0.0, 1.0],
+]
+
+# Cache the device/dtype-resident kernel matrices (BBB: [64,64], A3d: [16,64]).
+_WINO3D_MAT_CACHE = {}
+
+
+def _kron3(m: torch.Tensor) -> torch.Tensor:
+    """Separable 3-axis Kronecker product m (x) m (x) m."""
+    return torch.kron(torch.kron(m, m), m)
+
+
+def get_winograd3d_kernel_matrices(device, dtype):
+    """Return (BBB, A3d) for the in-kernel transforms, in `dtype` on `device`.
+
+    BBB = B^T (x) B^T (x) B^T  -> [64, 64]   (input/data transform).
+    A3d = A^T (x) A^T (x) A^T  -> [8, 64], zero-padded to [16, 64] so the output
+    transform's tl.dot has M>=16 (WMMA tile floor). Both are {-1,0,1}, exact in fp16.
+    """
+    key = (str(device), dtype)
+    cached = _WINO3D_MAT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    bt = torch.tensor(_WINO3D_BT, dtype=torch.float32, device=device)
+    at = torch.tensor(_WINO3D_AT, dtype=torch.float32, device=device)
+    bbb = _kron3(bt).contiguous()  # [64, 64]
+    a3d_small = _kron3(at).contiguous()  # [8, 64]
+    a3d = torch.zeros((16, 64), dtype=torch.float32, device=device)
+    a3d[:8, :] = a3d_small
+    item = (bbb.to(dtype).contiguous(), a3d.to(dtype).contiguous())
+    _WINO3D_MAT_CACHE[key] = item
+    return item
+
+
+def winograd3d_filter_matrix(device) -> torch.Tensor:
+    """G (x) G (x) G  -> [64, 27], fp32. Maps a flat 3x3x3 filter to 64 alphas."""
+    g = torch.tensor(_WINO3D_G, dtype=torch.float32, device=device)
+    return _kron3(g).contiguous()
+
+
 def apply_activation(y: torch.Tensor, activation: str):
     if activation == "relu":
         return F.relu(y)
