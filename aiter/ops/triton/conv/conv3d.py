@@ -5,12 +5,24 @@ from typing import Optional
 import torch
 
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.conv._utils import BLOCK_K, _out_dhw
-from aiter.ops.triton.conv._prepack import get_or_make_weight_pack_3d
+from aiter.ops.triton.conv._utils import (
+    BLOCK_K,
+    _out_dhw,
+    _is_1x1x1_conv,
+    _is_3x3x3_conv,
+)
+from aiter.ops.triton.conv._prepack import (
+    get_or_make_weight_pack_3d,
+    get_or_make_weight_pack_3x3x3,
+    get_or_make_input_pack_cblocked_3d,
+)
 from aiter.ops.triton.conv._launch import (
     _launch_conv3d_general,
+    _launch_conv3d_1x1x1,
+    _launch_conv3d_3x3x3_ndhwc,
+    _launch_conv3d_3x3x3_cblocked,
     _select_conv3d_method,
-    specialized_enabled,
+    conv3d_method_implemented,
 )
 
 _LOGGER = AiterTritonLogger()
@@ -87,8 +99,11 @@ def conv3d_general(
     D_out, P, Q = _out_dhw(D, H, W_in, KD, KH, KW, stride, padding, dilation)
 
     if layout == "ndhwc":
-        y = torch.empty((N, K_out, D_out, P, Q), device=x.device, dtype=x.dtype).to(
-            memory_format=torch.channels_last_3d
+        y = torch.empty(
+            (N, K_out, D_out, P, Q),
+            device=x.device,
+            dtype=x.dtype,
+            memory_format=torch.channels_last_3d,
         )
     else:
         y = torch.empty((N, K_out, D_out, P, Q), device=x.device, dtype=x.dtype)
@@ -122,28 +137,168 @@ def conv3d_general(
     return y
 
 
-def conv3d_1x1x1(*args, **kwargs):
-    """Specialized 1x1x1 GEMM kernel — Phase 2. Not yet implemented."""
-    raise NotImplementedError(
-        "conv3d_1x1x1 lands in Phase 2; the router currently falls back to "
-        "conv3d_general for 1x1x1 shapes."
+def conv3d_1x1x1(
+    x,
+    w_oidhw,
+    bias=None,
+    stride=(1, 1, 1),
+    padding=(0, 0, 0),
+    dilation=(1, 1, 1),
+    activation="none",
+    block_k=BLOCK_K,
+    layout="ncdhw",
+):
+    """NCDHW/NDHWC conv3d for 1x1x1 kernels (pure channel-reduction GEMM).
+    Output dtype always matches the input. Raises ValueError for non-1x1x1."""
+    assert x.is_cuda and w_oidhw.is_cuda
+    N, C, D, H, W_in = x.shape
+    K_out, Cw, KD, KH, KW = w_oidhw.shape
+    assert Cw == C, f"weight C ({Cw}) != input C ({C})"
+    if not _is_1x1x1_conv(KD, KH, KW, dilation):
+        raise ValueError(
+            f"conv3d_1x1x1 requires a 1x1x1 kernel with dilation=(1,1,1), "
+            f"got {KD}x{KH}x{KW} dilation={dilation}"
+        )
+    D_out, P, Q = _out_dhw(D, H, W_in, KD, KH, KW, stride, padding, dilation)
+
+    if layout == "ndhwc":
+        # Allocate channels-last directly — avoids a per-call reorder of the
+        # (large) output that .to(channels_last_3d) on a fresh tensor would do.
+        y = torch.empty(
+            (N, K_out, D_out, P, Q),
+            device=x.device,
+            dtype=x.dtype,
+            memory_format=torch.channels_last_3d,
+        )
+    else:
+        y = torch.empty((N, K_out, D_out, P, Q), device=x.device, dtype=x.dtype)
+    bias_fp32 = bias.float().contiguous() if bias is not None else None
+    _launch_conv3d_1x1x1(
+        x,
+        w_oidhw.contiguous(),
+        bias_fp32,
+        y,
+        N,
+        C,
+        D,
+        H,
+        W_in,
+        K_out,
+        D_out,
+        P,
+        Q,
+        stride,
+        padding,
+        activation,
+        layout=layout,
     )
+    return y
 
 
-def conv3d_ncdhw_cblocked(*args, **kwargs):
-    """Specialized NCDHWc 3x3x3 kernel — Phase 3. Not yet implemented."""
-    raise NotImplementedError(
-        "conv3d 3x3x3 cblocked lands in Phase 3; the router currently falls "
-        "back to conv3d_general for 3x3x3 shapes."
+def conv3d_ncdhw_cblocked(
+    x,
+    w_oidhw,
+    bias=None,
+    stride=(1, 1, 1),
+    padding=(0, 0, 0),
+    dilation=(1, 1, 1),
+    activation="none",
+    block_k=BLOCK_K,
+):
+    """NCDHW conv3d for 3x3x3 kernels via channel-blocked (NCDHWc) input packing.
+    Repacks the NCDHW input to NCDHWc for coalesced channel loads and writes
+    NCDHW-contiguous output. Output dtype matches the input. Raises ValueError for
+    non-3x3x3."""
+    assert x.is_cuda and w_oidhw.is_cuda
+    N, C, D, H, W_in = x.shape
+    K_out, Cw, KD, KH, KW = w_oidhw.shape
+    assert Cw == C, f"weight C ({Cw}) != input C ({C})"
+    if not _is_3x3x3_conv(KD, KH, KW):
+        raise ValueError(
+            f"conv3d_ncdhw_cblocked requires a 3x3x3 kernel, got {KD}x{KH}x{KW}"
+        )
+    D_out, P, Q = _out_dhw(D, H, W_in, KD, KH, KW, stride, padding, dilation)
+
+    y = torch.empty((N, K_out, D_out, P, Q), device=x.device, dtype=x.dtype)
+    bias_fp32 = bias.float().contiguous() if bias is not None else None
+    w_3x3x3, (_, C_pad) = get_or_make_weight_pack_3x3x3(w_oidhw.contiguous(), block_k)
+    Cb = block_k  # channel-block size matches the weight channel padding block
+    x_blocked, C_pad_x = get_or_make_input_pack_cblocked_3d(x, Cb)
+    assert C_pad_x == C_pad, f"channel padding mismatch: input {C_pad_x} vs weight {C_pad}"
+    _launch_conv3d_3x3x3_cblocked(
+        x_blocked,
+        w_3x3x3,
+        bias_fp32,
+        y,
+        N,
+        C,
+        D,
+        H,
+        W_in,
+        K_out,
+        D_out,
+        P,
+        Q,
+        C_pad,
+        Cb,
+        stride,
+        padding,
+        dilation,
+        activation,
     )
+    return y
 
 
-def conv3d_ndhwc_3x3x3(*args, **kwargs):
-    """Specialized NDHWC 3x3x3 kernel — Phase 3. Not yet implemented."""
-    raise NotImplementedError(
-        "conv3d 3x3x3 NDHWC lands in Phase 3; the router currently falls back "
-        "to conv3d_general for 3x3x3 shapes."
+def conv3d_ndhwc_3x3x3(
+    x,
+    w_oidhw,
+    bias=None,
+    stride=(1, 1, 1),
+    padding=(0, 0, 0),
+    dilation=(1, 1, 1),
+    activation="none",
+    block_k=BLOCK_K,
+):
+    """NDHWC conv3d for 3x3x3 kernels (direct, channels-contiguous, no input repack).
+    Input must already be channels_last_3d. Output dtype matches the input.
+    Raises ValueError for non-3x3x3."""
+    assert x.is_cuda and w_oidhw.is_cuda
+    N, C, D, H, W_in = x.shape
+    K_out, Cw, KD, KH, KW = w_oidhw.shape
+    assert Cw == C, f"weight C ({Cw}) != input C ({C})"
+    if not _is_3x3x3_conv(KD, KH, KW):
+        raise ValueError(f"conv3d_ndhwc_3x3x3 requires a 3x3x3 kernel, got {KD}x{KH}x{KW}")
+    D_out, P, Q = _out_dhw(D, H, W_in, KD, KH, KW, stride, padding, dilation)
+
+    y = torch.empty(
+        (N, K_out, D_out, P, Q),
+        device=x.device,
+        dtype=x.dtype,
+        memory_format=torch.channels_last_3d,
     )
+    bias_fp32 = bias.float().contiguous() if bias is not None else None
+    w_3x3x3, (_, C_pad) = get_or_make_weight_pack_3x3x3(w_oidhw.contiguous(), block_k)
+    _launch_conv3d_3x3x3_ndhwc(
+        x,
+        w_3x3x3,
+        bias_fp32,
+        y,
+        N,
+        C,
+        D,
+        H,
+        W_in,
+        K_out,
+        D_out,
+        P,
+        Q,
+        C_pad,
+        stride,
+        padding,
+        dilation,
+        activation,
+    )
+    return y
 
 
 def conv3d_ncdhw(
@@ -167,16 +322,16 @@ def conv3d_ncdhw(
     method = _select_conv3d_method(
         N, C, D, H, W_in, K_out, KD, KH, KW, stride, dilation
     )
-    # Phase 1: specialized kernels not built yet; collapse to general unless the
-    # feature flag is on (and even then they raise NotImplementedError). This
-    # keeps routing live without breaking real calls.
-    if method != "general" and not specialized_enabled():
+    # A specialized method whose kernel isn't built yet (for this layout) collapses
+    # to general. NCDHW 3x3x3 has no direct kernel yet → falls back to general.
+    if not conv3d_method_implemented(method, "ncdhw"):
         method = "general"
 
     if method == "1x1x1":
         _last_triton_kernel = "_conv3d_1x1x1_kernel"
         return conv3d_1x1x1(
-            x, w_oidhw, bias, stride, padding, dilation, activation, block_k
+            x, w_oidhw, bias, stride, padding, dilation, activation, block_k,
+            layout="ncdhw",
         )
     elif method == "3x3x3":
         _last_triton_kernel = "_conv3d_3x3x3_cblocked_kernel"
@@ -224,13 +379,14 @@ def conv3d_ndhwc(
     method = _select_conv3d_method(
         N, C, D, H, W_in, K_out, KD, KH, KW, stride, dilation
     )
-    if method != "general" and not specialized_enabled():
+    if not conv3d_method_implemented(method, "ndhwc"):
         method = "general"
 
     if method == "1x1x1":
         _last_triton_kernel = "_conv3d_1x1x1_kernel"
         return conv3d_1x1x1(
-            x, w_oidhw, bias, stride, padding, dilation, activation, block_k
+            x, w_oidhw, bias, stride, padding, dilation, activation, block_k,
+            layout="ndhwc",
         )
     elif method == "3x3x3":
         _last_triton_kernel = "_conv3d_3x3x3_ndhwc_kernel"

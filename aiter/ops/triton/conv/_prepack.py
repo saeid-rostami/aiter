@@ -47,9 +47,12 @@ _PACK_CACHE_3x3 = _LRUPackCache()
 # and the bench clears this per-call to model per-batch repack cost.
 _PACK_CACHE_CBLOCKED: Dict = {}
 _PACK_CACHE_WINOGRAD_F4X3 = _LRUPackCache()
-# 3D conv weight pack — same LRU rationale as _PACK_CACHE (weights reused every
+# 3D conv weight packs — same LRU rationale as _PACK_CACHE (weights reused every
 # forward pass, so a whole model's 3D conv weights stay warm).
 _PACK_CACHE_3D = _LRUPackCache()
+_PACK_CACHE_3x3x3_3D = _LRUPackCache()
+# 3D input pack — single-entry dict by design (unique per call), like _PACK_CACHE_CBLOCKED.
+_PACK_CACHE_CBLOCKED_3D: Dict = {}
 
 
 def prepack_oihw_to_kmajor(w_oihw: torch.Tensor, block_k: int = BLOCK_K):
@@ -111,6 +114,80 @@ def get_or_make_weight_pack_3d(w_oidhw: torch.Tensor, block_k: int = BLOCK_K):
         return entry[1]
     item = prepack_oidhw_to_kmajor(w_oidhw, block_k)
     _PACK_CACHE_3D.put(key, w_oidhw, item)
+    return item
+
+
+def prepack_oidhw_to_3x3x3(w_oidhw: torch.Tensor, block_c: int = BLOCK_K):
+    """Pack weights as [K_out, 27, C_pad] for the 3x3x3 specialized kernel.
+    The 27 axis flattens (KD, KH, KW) row-major (tap = kd*9 + kh*3 + kw), matching
+    the kernel's tap loop. 3D analog of prepack_oihw_to_3x3."""
+    K_out, C, KD, KH, KW = w_oidhw.shape
+    assert KD == 3 and KH == 3 and KW == 3
+    C_pad = ((C + block_c - 1) // block_c) * block_c
+    w_rs = w_oidhw.reshape(K_out, C, 27).permute(0, 2, 1).contiguous()  # [K_out, 27, C]
+    if C_pad != C:
+        pad = torch.zeros(
+            (K_out, 27, C_pad - C), device=w_oidhw.device, dtype=w_oidhw.dtype
+        )
+        w_rs = torch.cat([w_rs, pad], dim=2)
+    return w_rs.contiguous(), (K_out, C_pad)
+
+
+def get_or_make_weight_pack_3x3x3(w_oidhw: torch.Tensor, block_c: int = BLOCK_K):
+    key = (
+        _storage_ptr(w_oidhw),
+        tuple(w_oidhw.shape),
+        w_oidhw.dtype,
+        block_c,
+        int(getattr(w_oidhw, "_version", 0)),
+    )
+    cached = _PACK_CACHE_3x3x3_3D.get(key)
+    if cached is not None:
+        return cached[1]
+    item = prepack_oidhw_to_3x3x3(w_oidhw, block_c)
+    _PACK_CACHE_3x3x3_3D.put(key, w_oidhw, item)
+    return item
+
+
+def prepack_ncdhw_to_cblocked(x: torch.Tensor, block_c: int = BLOCK_K):
+    """Pack NCDHW input into channel-blocked layout [N, C_blocks, D, H, W, Cb].
+    Within each block of Cb channels, data is contiguous (stride=1).
+    3D analog of prepack_nchw_to_cblocked."""
+    N, C, D, H, W = x.shape
+    Cb = block_c
+    C_blocks = (C + Cb - 1) // Cb
+    C_pad = C_blocks * Cb
+
+    if C_pad != C:
+        x_padded = torch.zeros((N, C_pad, D, H, W), device=x.device, dtype=x.dtype)
+        x_padded[:, :C, :, :, :] = x
+    else:
+        x_padded = x
+
+    x_blocked = (
+        x_padded.reshape(N, C_blocks, Cb, D, H, W)
+        .permute(0, 1, 3, 4, 5, 2)
+        .contiguous()
+    )
+    return x_blocked, C_pad
+
+
+def get_or_make_input_pack_cblocked_3d(x: torch.Tensor, block_c: int = BLOCK_K):
+    key = (
+        _storage_ptr(x),
+        tuple(x.shape),
+        x.dtype,
+        block_c,
+        int(getattr(x, "_version", 0)),
+    )
+    cached = _PACK_CACHE_CBLOCKED_3D.get(key)
+    if cached is not None:
+        src_ref, item = cached
+        if src_ref is not None and _storage_ptr(src_ref) == key[0]:
+            return item
+    item = prepack_ncdhw_to_cblocked(x, block_c)
+    _PACK_CACHE_CBLOCKED_3D.clear()
+    _PACK_CACHE_CBLOCKED_3D[key] = (x, item)
     return item
 
 

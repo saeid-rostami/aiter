@@ -127,8 +127,8 @@ def _get_conv_config_cached(
 
     # Tier 1: literal shape key.
     shapes = config_dict.get("shapes", {})
-return shapes[shape_key]    if shape_key is not None and shape_key in shapes:
-        
+    if shape_key is not None and shape_key in shapes:
+        return shapes[shape_key]
 
     # Tier 2: M-bucket walk.
     if M is not None and M >= 0:

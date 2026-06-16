@@ -23,9 +23,16 @@ import torch.nn.functional as F
 from aiter.ops.triton.conv._utils import (
     dynamic_conv_tolerances,
     _out_dhw,
+    _is_1x1x1_conv,
+    _is_3x3x3_conv,
     apply_activation,
 )
-from aiter.ops.triton.conv.conv3d import conv3d_ncdhw, conv3d_ndhwc
+from aiter.ops.triton.conv.conv3d import (
+    conv3d_ncdhw,
+    conv3d_ndhwc,
+    conv3d_1x1x1,
+    conv3d_ncdhw_cblocked,
+)
 
 # -- Architecture gating ------------------------------------------------------
 SUPPORTED_ARCHS = {
@@ -41,8 +48,21 @@ MethodEntry = namedtuple(
     "MethodEntry", ["kernel_fn", "guard_fn", "is_winograd", "bench_tag", "short_name"]
 )
 
+
+def _1x1x1_guard(KD, KH, KW, stride, dilation, C):
+    return _is_1x1x1_conv(KD, KH, KW, dilation)
+
+
+def _3x3x3_guard(KD, KH, KW, stride, dilation, C):
+    return _is_3x3x3_conv(KD, KH, KW)
+
+
 METHOD_REGISTRY = {
     "default": MethodEntry(conv3d_ncdhw, None, False, "", "default"),
+    "1x1x1": MethodEntry(conv3d_1x1x1, _1x1x1_guard, False, "[1x1x1]", "1x1x1"),
+    "cblocked": MethodEntry(
+        conv3d_ncdhw_cblocked, _3x3x3_guard, False, "[cblocked]", "cblocked"
+    ),
 }
 
 ORDERED_METHODS = list(METHOD_REGISTRY.keys())

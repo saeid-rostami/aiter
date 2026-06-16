@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import os
-
 import torch
 
 try:
@@ -50,6 +48,16 @@ from aiter.ops.triton._triton_kernels.conv.conv_3x3_winograd_f4x3 import (
 from aiter.ops.triton._triton_kernels.conv.conv3d_general import (
     _conv3d_general_kernel,
     _get_config as _get_config_general_3d,
+)
+from aiter.ops.triton._triton_kernels.conv.conv3d_1x1x1 import (
+    _conv3d_1x1x1_kernel,
+    _get_config as _get_config_1x1x1_3d,
+)
+from aiter.ops.triton._triton_kernels.conv.conv3d_3x3x3 import (
+    _conv3d_3x3x3_ndhwc_kernel,
+    _conv3d_3x3x3_cblocked_kernel,
+    _get_config_ndhwc as _get_config_3x3x3_ndhwc_3d,
+    _get_config_cblocked as _get_config_3x3x3_cblocked_3d,
 )
 
 
@@ -712,33 +720,34 @@ def _launch_winograd_f4x3_cblocked(
 
 # -- 3D convolution -----------------------------------------------------------
 
-# Phase 1 ships only the general 3D kernel. The router already returns the
-# specialized names so 1x1x1 / 3x3x3 wiring is live, but they are gated behind
-# this flag (default off) until those kernels land — when off, the specialized
-# names collapse to "general" at the call site. See conv/DESIGN.md routing.
-_CONV3D_SPECIALIZED_ENABLED = os.environ.get(
-    "AITER_TRITON_CONV3D_SPECIALIZED", "0"
-).lower() in ("1", "true", "yes", "on")
+# Methods with a built kernel today, per layout. The router (_select_conv3d_method)
+# may return a specialized name before its kernel exists for that layout;
+# conv3d_method_implemented gates that so unbuilt (method, layout) pairs fall back
+# to "general". 3x3x3 is built for NDHWC but not yet NCDHW (cblocked TBD — see
+# the Phase-3 decision in the handoff). Delete this gate once all are built.
+_IMPLEMENTED_CONV3D_METHODS = {
+    "ncdhw": frozenset({"general", "1x1x1", "3x3x3"}),
+    "ndhwc": frozenset({"general", "1x1x1", "3x3x3"}),
+}
+
+
+def conv3d_method_implemented(method, layout) -> bool:
+    return method in _IMPLEMENTED_CONV3D_METHODS[layout]
 
 
 def _select_conv3d_method(N, C, D, H, W, K_out, KD, KH, KW, stride, dilation):
     """Pick the best 3D conv kernel for a shape.
 
-    Phase 1: returns "1x1x1" / "3x3x3" / "general" so the dispatch tree is
-    exercised, but only "general" has a kernel today. conv3d_ncdhw / _ndhwc
-    fall back to general for the specialized names unless the kernels exist
-    (gated by AITER_TRITON_CONV3D_SPECIALIZED). Thresholds (channel/tile-count
-    cutoffs like the 2D _select_3x3_method) will be added with the 3x3x3 kernel.
+    Returns "1x1x1" / "3x3x3" / "general". Built methods (conv3d_method_implemented)
+    run directly; not-yet-built ones (e.g. "3x3x3" today) are collapsed to "general"
+    by the caller. Thresholds (channel/tile-count cutoffs like the 2D
+    _select_3x3_method) will be added with the 3x3x3 kernel.
     """
     if _is_1x1x1_conv(KD, KH, KW, dilation):
         return "1x1x1"
     if _is_3x3x3_conv(KD, KH, KW):
         return "3x3x3"
     return "general"
-
-
-def specialized_enabled() -> bool:
-    return _CONV3D_SPECIALIZED_ENABLED
 
 
 def _launch_conv3d_general(
@@ -838,5 +847,275 @@ def _launch_conv3d_general(
         HAS_BIAS=1 if bias_fp32 is not None else 0,
         ACTIVATION=activation,
         LAYOUT=layout,
+        **config,
+    )
+
+
+def _launch_conv3d_1x1x1(
+    x,
+    w_oidhw,
+    bias_fp32,
+    y,
+    N,
+    C,
+    D,
+    H,
+    W_in,
+    K_out,
+    D_out,
+    P,
+    Q,
+    stride,
+    padding,
+    activation,
+    layout="ncdhw",
+):
+    """Launch the specialized 1x1x1 conv kernel (pure GEMM). layout: 'ncdhw'/'ndhwc'."""
+    if triton is None:
+        raise RuntimeError("Triton not available")
+
+    sd, sh, sw = stride
+    pd, ph, pw = padding
+
+    # [K_out, C, 1, 1, 1] -> [K_out, C]
+    w = w_oidhw.squeeze(-1).squeeze(-1).squeeze(-1).contiguous()
+
+    def grid(meta):
+        BM = meta["BLOCK_M"]
+        BN = meta["BLOCK_N"]
+        return (triton.cdiv(N * D_out * P * Q, BM) * triton.cdiv(K_out, BN),)
+
+    bias_arg = bias_fp32 if bias_fp32 is not None else w.new_empty(1)
+
+    M_total = N * D_out * P * Q
+
+    shape_key = format_shape_key_3d(
+        N=N,
+        C=C,
+        D=D,
+        H=H,
+        W=W_in,
+        K=K_out,
+        KD=1,
+        KH=1,
+        KW=1,
+        sd=sd,
+        sh=sh,
+        sw=sw,
+        pd=pd,
+        ph=ph,
+        pw=pw,
+        dd=1,
+        dh=1,
+        dw=1,
+    )
+    config = _get_config_1x1x1_3d(shape_key=shape_key, M=M_total, layout=layout)
+
+    _conv3d_1x1x1_kernel[grid](
+        x,
+        w,
+        bias_arg,
+        y,
+        N,
+        C,
+        D,
+        H,
+        W_in,
+        K_out,
+        D_out,
+        P,
+        Q,
+        sd,
+        sh,
+        sw,
+        pd,
+        ph,
+        pw,
+        M_total,
+        HAS_BIAS=1 if bias_fp32 is not None else 0,
+        ACTIVATION=activation,
+        LAYOUT=layout,
+        **config,
+    )
+
+
+def _launch_conv3d_3x3x3_ndhwc(
+    x,
+    w_3x3x3,
+    bias_fp32,
+    y,
+    N,
+    C,
+    D,
+    H,
+    W_in,
+    K_out,
+    D_out,
+    P,
+    Q,
+    C_pad,
+    stride,
+    padding,
+    dilation,
+    activation,
+):
+    """Launch the specialized NDHWC 3x3x3 kernel (hardcoded stride_c=1, stride_k=1)."""
+    if triton is None:
+        raise RuntimeError("Triton not available")
+
+    sd, sh, sw = stride
+    pd, ph, pw = padding
+    dd, dh, dw = dilation
+
+    def grid(meta):
+        BM = meta["BLOCK_M"]
+        BN = meta["BLOCK_N"]
+        return (triton.cdiv(N * D_out * P * Q, BM) * triton.cdiv(K_out, BN),)
+
+    bias_arg = bias_fp32 if bias_fp32 is not None else w_3x3x3.new_empty(1)
+
+    M_total = N * D_out * P * Q
+
+    shape_key = format_shape_key_3d(
+        N=N,
+        C=C,
+        D=D,
+        H=H,
+        W=W_in,
+        K=K_out,
+        KD=3,
+        KH=3,
+        KW=3,
+        sd=sd,
+        sh=sh,
+        sw=sw,
+        pd=pd,
+        ph=ph,
+        pw=pw,
+        dd=dd,
+        dh=dh,
+        dw=dw,
+    )
+    config = _get_config_3x3x3_ndhwc_3d(shape_key=shape_key, M=M_total)
+
+    _conv3d_3x3x3_ndhwc_kernel[grid](
+        x,
+        w_3x3x3,
+        bias_arg,
+        y,
+        N,
+        C,
+        D,
+        H,
+        W_in,
+        K_out,
+        D_out,
+        P,
+        Q,
+        C_pad,
+        sd,
+        sh,
+        sw,
+        pd,
+        ph,
+        pw,
+        dd,
+        dh,
+        dw,
+        M_total,
+        HAS_BIAS=1 if bias_fp32 is not None else 0,
+        ACTIVATION=activation,
+        **config,
+    )
+
+
+def _launch_conv3d_3x3x3_cblocked(
+    x_blocked,
+    w_3x3x3,
+    bias_fp32,
+    y,
+    N,
+    C,
+    D,
+    H,
+    W_in,
+    K_out,
+    D_out,
+    P,
+    Q,
+    C_pad,
+    Cb,
+    stride,
+    padding,
+    dilation,
+    activation,
+):
+    """Launch the NCDHWc cblocked 3x3x3 kernel (NCDHW-contiguous output)."""
+    if triton is None:
+        raise RuntimeError("Triton not available")
+
+    sd, sh, sw = stride
+    pd, ph, pw = padding
+    dd, dh, dw = dilation
+
+    def grid(meta):
+        BM = meta["BLOCK_M"]
+        BN = meta["BLOCK_N"]
+        return (triton.cdiv(N * D_out * P * Q, BM) * triton.cdiv(K_out, BN),)
+
+    bias_arg = bias_fp32 if bias_fp32 is not None else w_3x3x3.new_empty(1)
+
+    M_total = N * D_out * P * Q
+
+    shape_key = format_shape_key_3d(
+        N=N,
+        C=C,
+        D=D,
+        H=H,
+        W=W_in,
+        K=K_out,
+        KD=3,
+        KH=3,
+        KW=3,
+        sd=sd,
+        sh=sh,
+        sw=sw,
+        pd=pd,
+        ph=ph,
+        pw=pw,
+        dd=dd,
+        dh=dh,
+        dw=dw,
+    )
+    config = _get_config_3x3x3_cblocked_3d(shape_key=shape_key, M=M_total)
+
+    _conv3d_3x3x3_cblocked_kernel[grid](
+        x_blocked,
+        w_3x3x3,
+        bias_arg,
+        y,
+        N,
+        C,
+        D,
+        H,
+        W_in,
+        K_out,
+        D_out,
+        P,
+        Q,
+        C_pad,
+        Cb,
+        sd,
+        sh,
+        sw,
+        pd,
+        ph,
+        pw,
+        dd,
+        dh,
+        dw,
+        M_total,
+        HAS_BIAS=1 if bias_fp32 is not None else 0,
+        ACTIVATION=activation,
         **config,
     )
