@@ -103,6 +103,20 @@ def _is_1x1x1_conv(T, R, S, dilation):
     return T == 1 and R == 1 and S == 1 and dilation == (1, 1, 1)
 
 
+def _is_winograd3d_hw_eligible(T, R, S, stride, dilation, C=None):
+    """Eligibility for 2.5D Winograd F(4,3)-on-HW: 3x3x3, unit stride/dilation.
+    (Depth is a direct 3-tap reduction, so only H,W need the Winograd geometry.)"""
+    if not (T == 3 and R == 3 and S == 3):
+        return False
+    if stride != (1, 1, 1) or dilation != (1, 1, 1):
+        return False
+    # Winograd output transform amplifies bf16 rounding; too few channels can't
+    # absorb it (same rationale as 2D _is_winograd_eligible).
+    if C is not None and C < 4:
+        return False
+    return True
+
+
 def _is_winograd_eligible(R, S, stride, dilation, C=None):
     if not (R == 3 and S == 3 and stride == (1, 1) and dilation == (1, 1)):
         return False

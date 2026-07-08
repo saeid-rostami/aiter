@@ -66,6 +66,7 @@ _PACK_CACHE_3x3 = _LRUPackCache()
 _PACK_CACHE_WINOGRAD_F4X3 = _LRUPackCache()
 _PACK_CACHE_3D = _LRUPackCache()
 _PACK_CACHE_3x3x3 = _LRUPackCache()
+_PACK_CACHE_WINOGRAD_HW_F4X3 = _LRUPackCache()
 
 
 def prepack_oihw_to_kmajor(w_oihw: torch.Tensor, block_k: int = BLOCK_K):
@@ -274,6 +275,57 @@ def prepack_winograd_filter_f4x3(w_oihw: torch.Tensor, block_c: int = BLOCK_K):
         )
         u = torch.cat([u, pad], dim=2)
     return u.to(w_oihw.dtype).contiguous(), C_pad
+
+
+def prepack_winograd_hw_filter_f4x3(w_oidhw: torch.Tensor, block_c: int = BLOCK_K):
+    """Filter transform for 2.5D Winograd (F(4x4,3x3) on H,W + direct depth).
+
+    Applies the 2D F(4,3) filter transform ``G g Gᵀ`` to each of the 3 depth
+    slices of a 3x3x3 weight ``[K_out, C, 3, 3, 3]``, producing
+    ``U[3, 36, K_out, C_pad]`` (tap-major). Runs once per weight in fp32, then
+    cast to the activation dtype. 3D-depth analogue of
+    :func:`prepack_winograd_filter_f4x3`.
+    """
+    K_out, C, T, R, S = w_oidhw.shape
+    assert T == 3 and R == 3 and S == 3
+    C_pad = ((C + block_c - 1) // block_c) * block_c
+    G = torch.tensor(
+        [
+            [1.0 / 4, 0.0, 0.0],
+            [-1.0 / 6, -1.0 / 6, -1.0 / 6],
+            [-1.0 / 6, 1.0 / 6, -1.0 / 6],
+            [1.0 / 24, 1.0 / 12, 1.0 / 6],
+            [1.0 / 24, -1.0 / 12, 1.0 / 6],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=torch.float32,
+        device=w_oidhw.device,
+    )
+    g = w_oidhw.float()  # [K_out, C, 3, 3, 3]
+    # For each depth tap t: U_t = G g[:,:,t] Gᵀ -> [K_out, C, 6, 6]
+    u = torch.einsum("ij,kctjl,lm->kctim", G, g, G.t())  # [K_out, C, 3, 6, 6]
+    u = u.reshape(K_out, C, 3, 36).permute(2, 3, 0, 1).contiguous()  # [3, 36, K, C]
+    if C_pad != C:
+        pad = torch.zeros(
+            (3, 36, K_out, C_pad - C), device=w_oidhw.device, dtype=torch.float32
+        )
+        u = torch.cat([u, pad], dim=3)
+    return u.to(w_oidhw.dtype).contiguous(), C_pad
+
+
+def get_or_make_winograd_hw_filter_f4x3(w_oidhw: torch.Tensor, block_c: int = BLOCK_K):
+    key = (
+        _storage_ptr(w_oidhw),
+        tuple(w_oidhw.shape),
+        w_oidhw.dtype,
+        block_c,
+    )
+    cached = _PACK_CACHE_WINOGRAD_HW_F4X3.get(key)
+    if cached is not None:
+        return cached[1]
+    item = prepack_winograd_hw_filter_f4x3(w_oidhw, block_c)
+    _PACK_CACHE_WINOGRAD_HW_F4X3.put(key, w_oidhw, item)
+    return item
 
 
 def get_or_make_winograd_filter_f4x3(w_oihw: torch.Tensor, block_c: int = BLOCK_K):

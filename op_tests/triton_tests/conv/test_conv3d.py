@@ -19,9 +19,19 @@ import torch
 import torch.nn.functional as F
 
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.conv.conv3d import conv3d, _resolve_route, Route3D
+from aiter.ops.triton.conv.conv3d import (
+    conv3d,
+    conv3d_winograd_hw_f4x3,
+    conv3d_winograd_hw_f4x3_cblocked,
+    _resolve_route,
+    Route3D,
+)
 
-from ._helpers import ALL_SUPPORTED_ARCHS, dynamic_conv_tolerances
+from ._helpers import (
+    ALL_SUPPORTED_ARCHS,
+    dynamic_conv_tolerances,
+    _winograd_tolerances,
+)
 
 _current_arch = get_arch()
 if _current_arch not in ALL_SUPPORTED_ARCHS:
@@ -81,7 +91,13 @@ def _run_case(
         ref = F.relu(ref)
 
     K_red = C * T * R * S
-    rtol, atol = dynamic_conv_tolerances(dtype, K_red)
+    # The Winograd path amplifies rounding — use the 6x-bumped tolerance when
+    # this shape/layout actually routes there.
+    route = _resolve_route(T, R, S, stride, dil, C, layout)
+    if route is Route3D.WINOGRAD_HW:
+        rtol, atol = _winograd_tolerances(dtype, K_red)
+    else:
+        rtol, atol = dynamic_conv_tolerances(dtype, K_red)
     y32 = y.float()
     torch.testing.assert_close(y32, ref.to(y32.dtype), rtol=rtol, atol=atol)
 
@@ -163,18 +179,48 @@ def test_extra_shapes(shape, dtype, dtype_id, layout):
     )
 
 
+@pytest.mark.parametrize(
+    "wino_fn",
+    [conv3d_winograd_hw_f4x3, conv3d_winograd_hw_f4x3_cblocked],
+    ids=["plain", "cblocked"],
+)
+@pytest.mark.parametrize("dtype,dtype_id", DTYPES, ids=[d[1] for d in DTYPES])
+def test_winograd_variants(wino_fn, dtype, dtype_id):
+    """Both Winograd input variants (plain NCDHW read, cblocked NCDHWc read)
+    match F.conv3d within the 6x Winograd tolerance. The cblocked variant is not
+    routed by default (never faster here) but is kept available, so it needs
+    explicit coverage; the plain variant is also covered via routing."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    torch.manual_seed(0)
+    for N, C, D, H, W, K in [(1, 96, 4, 32, 40, 96), (1, 192, 3, 24, 28, 192)]:
+        x = torch.randn(N, C, D, H, W, device="cuda", dtype=dtype)
+        w = torch.randn(K, C, 3, 3, 3, device="cuda", dtype=dtype) * 0.1
+        b = torch.randn(K, device="cuda", dtype=dtype)
+        y = wino_fn(x, w, b, stride=(1, 1, 1), padding=(1, 1, 1))
+        ref = F.conv3d(x.float(), w.float(), b.float(), stride=1, padding=1)
+        rtol, atol = _winograd_tolerances(dtype, C * 27)
+        torch.testing.assert_close(y.float(), ref, rtol=rtol, atol=atol)
+
+
 def test_routing():
+    s1 = (1, 1, 1)
     # 1x1x1 -> specialized channel-GEMM (layout-independent).
-    assert _resolve_route(1, 1, 1, (1, 1, 1), "ncdhw") is Route3D.ONE_X_ONE_X_ONE
-    assert _resolve_route(1, 1, 1, (1, 1, 1), "ndhwc") is Route3D.ONE_X_ONE_X_ONE
-    # 3x3x3 -> specialized kernel picked by layout.
-    assert _resolve_route(3, 3, 3, (1, 1, 1), "ncdhw") is Route3D.CBLOCKED_NCDHW
-    assert _resolve_route(3, 3, 3, (1, 1, 1), "ndhwc") is Route3D.NDHWC_3X3X3
+    assert _resolve_route(1, 1, 1, s1, s1, 128, "ncdhw") is Route3D.ONE_X_ONE_X_ONE
+    assert _resolve_route(1, 1, 1, s1, s1, 128, "ndhwc") is Route3D.ONE_X_ONE_X_ONE
+    # 3x3x3 NCDHW: Winograd when eligible (unit stride/dil, enough channels),
+    # else the direct cblocked kernel.
+    assert _resolve_route(3, 3, 3, s1, s1, 384, "ncdhw") is Route3D.WINOGRAD_HW
+    assert _resolve_route(3, 3, 3, s1, s1, 8, "ncdhw") is Route3D.CBLOCKED_NCDHW
+    assert (
+        _resolve_route(3, 3, 3, (2, 2, 2), s1, 384, "ncdhw") is Route3D.CBLOCKED_NCDHW
+    )
+    # 3x3x3 NDHWC -> channels-last kernel.
+    assert _resolve_route(3, 3, 3, s1, s1, 384, "ndhwc") is Route3D.NDHWC_3X3X3
     # No specialized kernel -> general.
-    assert _resolve_route(5, 5, 5, (1, 1, 1), "ncdhw") is Route3D.GENERAL
-    # Dilated variants have no specialized kernel yet -> general.
-    assert _resolve_route(3, 3, 3, (2, 2, 2), "ncdhw") is Route3D.GENERAL
-    assert _resolve_route(1, 1, 1, (2, 2, 2), "ncdhw") is Route3D.GENERAL
+    assert _resolve_route(5, 5, 5, s1, s1, 384, "ncdhw") is Route3D.GENERAL
+    assert _resolve_route(3, 3, 3, s1, (2, 2, 2), 384, "ncdhw") is Route3D.GENERAL
+    assert _resolve_route(1, 1, 1, s1, (2, 2, 2), 384, "ncdhw") is Route3D.GENERAL
 
 
 if __name__ == "__main__":

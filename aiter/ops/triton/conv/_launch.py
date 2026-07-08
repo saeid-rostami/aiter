@@ -31,6 +31,14 @@ from aiter.ops.triton._triton_kernels.conv.conv3d_3x3x3 import (
     _get_config_ndhwc as _get_config_3x3x3_ndhwc,
     _get_config_cblocked as _get_config_3x3x3_cblocked,
 )
+from aiter.ops.triton._triton_kernels.conv.conv3d_winograd_hw_f4x3 import (
+    _winograd_hw_f4x3_input_transform_kernel,
+    _winograd_hw_f4x3_batched_gemm_kernel,
+    _winograd_hw_f4x3_output_transform_kernel,
+    _get_config_input as _get_config_wino_hw_input,
+    _get_config_gemm as _get_config_wino_hw_gemm,
+    _get_config_output as _get_config_wino_hw_output,
+)
 from aiter.ops.triton._triton_kernels.conv.conv_3x3 import (
     _conv2d_3x3_nhwc_kernel,
     _conv2d_3x3_cblocked_kernel,
@@ -916,4 +924,121 @@ def _launch_3x3x3_cblocked(
         HAS_BIAS=bias_fp32 is not None,
         ACTIVATION=activation,
         **config,
+    )
+
+
+def _launch_winograd_hw_f4x3(
+    x,
+    U,
+    bias_fp32,
+    y,
+    N,
+    C,
+    D,
+    H,
+    W_in,
+    K_out,
+    OD,
+    P,
+    Q,
+    C_pad,
+    padding,
+    activation,
+    block_k=64,
+    x_blocked=None,
+):
+    """Launch 2.5D Winograd F(4x4,3x3) on H,W + direct depth: input transform ->
+    batched GEMM (3-tap depth reduction) -> output transform. NCDHW, stride=1,
+    dilation=1.
+
+    When ``x_blocked`` is given (NCDHWc), the input transform reads it with
+    coalesced channel loads (CBLOCKED path); otherwise it reads NCDHW ``x``.
+    GEMM and output transform are identical either way."""
+    pd, ph, pw = padding
+    tile_H = (P + 3) // 4
+    tile_W = (Q + 3) // 4
+    T_hw = tile_H * tile_W
+    T_v = N * D * T_hw
+    T_out = N * OD * T_hw
+
+    cblocked = x_blocked is not None
+    x_in = x_blocked if cblocked else x
+    input_dtype = x_in.dtype
+    V = torch.empty((36, T_v, C_pad), device=x_in.device, dtype=input_dtype)
+    M = torch.empty((36, T_out, K_out), device=x_in.device, dtype=torch.float32)
+
+    shape_key = format_shape_key_3d(
+        N=N,
+        C=C,
+        D=D,
+        H=H,
+        W=W_in,
+        K=K_out,
+        T=3,
+        R=3,
+        S=3,
+        sd=1,
+        sh=1,
+        sw=1,
+        pd=pd,
+        ph=ph,
+        pw=pw,
+        dd=1,
+        dh=1,
+        dw=1,
+    )
+    input_config = _get_config_wino_hw_input(shape_key=shape_key, M=T_out)
+    gemm_config = _get_config_wino_hw_gemm(shape_key=shape_key, M=T_out)
+    output_config = _get_config_wino_hw_output(shape_key=shape_key, M=T_out)
+
+    _winograd_hw_f4x3_input_transform_kernel[_make_wino_input_grid(T_v, C_pad)](
+        x_in,
+        V,
+        N,
+        C,
+        C_pad,
+        D,
+        H,
+        W_in,
+        tile_H,
+        tile_W,
+        T_v,
+        ph,
+        pw,
+        Cb=block_k,
+        CBLOCKED=cblocked,
+        **input_config,
+    )
+
+    _winograd_hw_f4x3_batched_gemm_kernel[_make_wino_gemm_grid(T_out, K_out)](
+        V,
+        U,
+        M,
+        N,
+        D,
+        OD,
+        T_hw,
+        T_v,
+        T_out,
+        K_out,
+        C_pad,
+        pd,
+        **gemm_config,
+    )
+
+    _winograd_hw_f4x3_output_transform_kernel[_make_wino_output_grid(T_out, K_out)](
+        M,
+        bias_fp32,
+        y,
+        N,
+        K_out,
+        OD,
+        P,
+        Q,
+        tile_H,
+        tile_W,
+        T_out,
+        HAS_BIAS=bias_fp32 is not None,
+        ACTIVATION=activation,
+        **output_config,
     )
