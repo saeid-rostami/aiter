@@ -44,7 +44,7 @@ def _conv3d_general_kernel(
     T: tl.constexpr,
     R: tl.constexpr,
     S: tl.constexpr,
-    O: tl.constexpr,
+    OD: tl.constexpr,
     P: tl.constexpr,
     Q: tl.constexpr,
     K_pad: tl.constexpr,
@@ -69,7 +69,7 @@ def _conv3d_general_kernel(
     """General conv3d kernel (im2col-free).
 
     Direct 3D analogue of ``_conv2d_general_kernel``: one GEMM over
-    ``M = N*O*P*Q`` rows x ``K_out`` cols, reducing over the flattened
+    ``M = N*OD*P*Q`` rows x ``K_out`` cols, reducing over the flattened
     ``C*T*R*S`` axis (padded to ``K_pad``). Each reduction index ``kred`` is
     decoded on the fly into ``(c, t, r, s)`` -> input coordinate ``(id, ih,
     iw)`` with a bounds mask plus a ``c < C`` channel-bound check, so the
@@ -86,12 +86,12 @@ def _conv3d_general_kernel(
         stride_x_d: tl.constexpr = H * W_in
         stride_x_c: tl.constexpr = D * H * W_in
         stride_x_n: tl.constexpr = C * D * H * W_in
-        # Y: [N, K_out, O, P, Q] contiguous
+        # Y: [N, K_out, OD, P, Q] contiguous
         stride_y_q: tl.constexpr = 1
         stride_y_p: tl.constexpr = Q
         stride_y_o: tl.constexpr = P * Q
-        stride_y_k: tl.constexpr = O * P * Q
-        stride_y_n: tl.constexpr = K_out * O * P * Q
+        stride_y_k: tl.constexpr = OD * P * Q
+        stride_y_n: tl.constexpr = K_out * OD * P * Q
     else:
         # X: [N, D, H, W_in, C] channels-last-3d (stride_x_c=1)
         stride_x_c: tl.constexpr = 1
@@ -99,12 +99,12 @@ def _conv3d_general_kernel(
         stride_x_h: tl.constexpr = W_in * C
         stride_x_d: tl.constexpr = H * W_in * C
         stride_x_n: tl.constexpr = D * H * W_in * C
-        # Y: [N, O, P, Q, K_out] channels-last-3d (stride_y_k=1)
+        # Y: [N, OD, P, Q, K_out] channels-last-3d (stride_y_k=1)
         stride_y_k: tl.constexpr = 1
         stride_y_q: tl.constexpr = K_out
         stride_y_p: tl.constexpr = Q * K_out
         stride_y_o: tl.constexpr = P * Q * K_out
-        stride_y_n: tl.constexpr = O * P * Q * K_out
+        stride_y_n: tl.constexpr = OD * P * Q * K_out
     # W: [K_out, K_pad] contiguous (K_pad = padded C*T*R*S)
     stride_w_kout: tl.constexpr = K_pad
     stride_w_kred: tl.constexpr = 1
@@ -130,7 +130,7 @@ def _conv3d_general_kernel(
     kout_mask = offs_n < K_out
 
     # Decode offs_m -> (n_idx, o_idx, p_idx, q_idx)
-    opq = O * P * Q
+    opq = OD * P * Q
     n_idx = offs_m[:, None] // opq
     rem_opq = offs_m[:, None] % opq
     o_idx = rem_opq // (P * Q)
@@ -225,10 +225,24 @@ def _conv3d_general_kernel(
     tl.store(y_ptrs, acc, mask=(m_mask[:, None] & kout_mask[None, :]))
 
 
-# Autotune search space (used when AITER_TRITON_CONV_AUTOTUNE=1).
+# Autotune / offline-sweep search space (used when AITER_TRITON_CONV_AUTOTUNE=1
+# and by tune_conv3d.py). num_stages is always 1 on RDNA (no async global->LDS
+# copy to pipeline). BLOCK_K is kept in {32, 64}: the reduction loop has no
+# `kred < K_pad` mask, and K_pad is padded to a multiple of 64, so a BLOCK_K
+# that doesn't divide K_pad would read past the packed weight.
 AUTOTUNE_3D_GENERAL_CONFIGS = [
     triton.Config(
         {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
+        num_warps=8,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
+        num_warps=8,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
         num_warps=8,
         num_stages=1,
     ),
@@ -238,7 +252,22 @@ AUTOTUNE_3D_GENERAL_CONFIGS = [
         num_stages=1,
     ),
     triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
+        {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
+        num_warps=8,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
+        num_warps=8,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 256, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
+        num_warps=8,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
         num_warps=8,
         num_stages=1,
     ),
@@ -248,7 +277,17 @@ AUTOTUNE_3D_GENERAL_CONFIGS = [
         num_stages=1,
     ),
     triton.Config(
-        {"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
+        {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
+        num_warps=4,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_SIZE_M": 8},
+        num_warps=8,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 32, "GROUP_SIZE_M": 8},
         num_warps=8,
         num_stages=1,
     ),

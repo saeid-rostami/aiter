@@ -3,12 +3,15 @@
 
 """Forward 3-D convolution on AMD ROCm via Triton.
 
-First cut: a single im2col-free "general" GEMM kernel that handles any 3D conv
-(any kernel size / stride / padding / dilation), in both NCDHW and NDHWC
-layouts. This is the 3D analogue of the conv2d ``general`` path and is the seed
-for later specialization (3x3x3 direct / cblocked / Winograd-3D). See
+A shape-driven router picks between a specialized 1x1x1 kernel (pure channel
+GEMM) and an im2col-free "general" GEMM kernel that handles any other 3D conv
+(any kernel size / stride / padding / dilation). Both run in NCDHW and NDHWC
+layouts. This mirrors the conv2d ``general`` / ``1x1`` split and is the seed for
+further specialization (3x3x3 direct / cblocked / Winograd-3D). See
 ``conv/DESIGN.md`` for the 2D design this mirrors.
 """
+
+from enum import Enum
 
 import torch
 
@@ -18,11 +21,25 @@ from aiter.ops.triton.conv._utils import (
     _conv3d_dims,
     _alloc_output_3d,
     _prep_bias,
+    _is_1x1x1_conv,
 )
 from aiter.ops.triton.conv._prepack import get_or_make_weight_pack_3d
-from aiter.ops.triton.conv._launch import _launch_general_3d
+from aiter.ops.triton.conv._launch import _launch_general_3d, _launch_1x1x1_3d
 
 _LOGGER = AiterTritonLogger()
+
+
+class Route3D(Enum):
+    # Values are kernel display names (parallel to conv2d's Route enum).
+    ONE_X_ONE_X_ONE = "_conv3d_1x1x1_kernel"
+    GENERAL = "_conv3d_general_kernel"
+
+
+def _resolve_route(T, R, S, dilation):
+    """Single source of dispatch for conv3d (parallel to conv2d._resolve_route)."""
+    if _is_1x1x1_conv(T, R, S, dilation):
+        return Route3D.ONE_X_ONE_X_ONE
+    return Route3D.GENERAL
 
 
 def conv3d(
@@ -98,11 +115,11 @@ def conv3d_general(
     weights. Handles any kernel size / stride / padding / dilation in either
     layout. ``x`` is trusted to already carry the physical strides implied by
     ``layout`` (the ``conv3d_ncdhw`` / ``conv3d_ndhwc`` wrappers normalize it)."""
-    N, C, D, H, W_in, K_out, T, R, S, O, P, Q = _conv3d_dims(
+    N, C, D, H, W_in, K_out, T, R, S, OD, P, Q = _conv3d_dims(
         x, w_oidhw, stride, padding, dilation
     )
 
-    y = _alloc_output_3d(N, K_out, O, P, Q, x, layout)
+    y = _alloc_output_3d(N, K_out, OD, P, Q, x, layout)
     bias_fp32 = _prep_bias(bias)
     w_k, K_pad = get_or_make_weight_pack_3d(w_oidhw.contiguous(), block_k)
     _launch_general_3d(
@@ -119,7 +136,7 @@ def conv3d_general(
         T,
         R,
         S,
-        O,
+        OD,
         P,
         Q,
         K_pad,
@@ -133,13 +150,74 @@ def conv3d_general(
     return y
 
 
+def conv3d_1x1x1(
+    x,
+    w_oidhw,
+    bias=None,
+    stride=(1, 1, 1),
+    padding=(0, 0, 0),
+    dilation=(1, 1, 1),
+    activation="none",
+    block_k=BLOCK_K,
+    layout="ncdhw",
+):
+    """conv3d for 1x1x1 kernels — a pure channel-reduction GEMM. Raises
+    ValueError for non-1x1x1. ``x`` is trusted to carry the physical strides
+    implied by ``layout`` (the ncdhw/ndhwc wrappers normalize it)."""
+    N, C, D, H, W_in, K_out, T, R, S, OD, P, Q = _conv3d_dims(
+        x, w_oidhw, stride, padding, dilation
+    )
+    if not _is_1x1x1_conv(T, R, S, dilation):
+        raise ValueError(
+            f"conv3d_1x1x1 requires 1x1x1 kernel with dilation=1, "
+            f"got {T}x{R}x{S} dilation={dilation}"
+        )
+
+    y = _alloc_output_3d(N, K_out, OD, P, Q, x, layout)
+    bias_fp32 = _prep_bias(bias)
+    _launch_1x1x1_3d(
+        x,
+        w_oidhw.contiguous(),
+        bias_fp32,
+        y,
+        N,
+        C,
+        D,
+        H,
+        W_in,
+        K_out,
+        OD,
+        P,
+        Q,
+        stride,
+        padding,
+        activation,
+        layout=layout,
+    )
+    return y
+
+
 def _route_and_run(
     x, w_oidhw, bias, stride, padding, dilation, activation, block_k, layout
 ):
-    """Shared dispatch body for conv3d_ncdhw / conv3d_ndhwc. Today there is a
-    single kernel (general), so this always dispatches to conv3d_general; it is
-    the seam where shape-driven specialization (3x3x3, etc.) will plug in,
-    mirroring conv2d's _route_and_run / _resolve_route."""
+    """Shared dispatch body for conv3d_ncdhw / conv3d_ndhwc: resolve the route
+    once and dispatch to the matching wrapper (parallel to conv2d._route_and_run).
+    """
+    K_out, _, T, R, S = w_oidhw.shape
+    route = _resolve_route(T, R, S, dilation)
+
+    if route == Route3D.ONE_X_ONE_X_ONE:
+        return conv3d_1x1x1(
+            x,
+            w_oidhw,
+            bias,
+            stride,
+            padding,
+            dilation,
+            activation,
+            block_k,
+            layout=layout,
+        )
     return conv3d_general(
         x,
         w_oidhw,

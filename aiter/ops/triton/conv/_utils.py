@@ -33,10 +33,10 @@ def _out_dhw(D, H, W, T, R, S, stride, padding, dilation):
     sd, sh, sw = stride
     pd, ph, pw = padding
     dd, dh, dw = dilation
-    O = (D + 2 * pd - dd * (T - 1) - 1) // sd + 1
+    OD = (D + 2 * pd - dd * (T - 1) - 1) // sd + 1
     P = (H + 2 * ph - dh * (R - 1) - 1) // sh + 1
     Q = (W + 2 * pw - dw * (S - 1) - 1) // sw + 1
-    return O, P, Q
+    return OD, P, Q
 
 
 def _conv3d_dims(x, w_oidhw, stride, padding, dilation):
@@ -49,8 +49,8 @@ def _conv3d_dims(x, w_oidhw, stride, padding, dilation):
     N, C, D, H, W_in = x.shape
     K_out, Cw, T, R, S = w_oidhw.shape
     assert Cw == C, f"weight in-channels {Cw} != input channels {C}"
-    O, P, Q = _out_dhw(D, H, W_in, T, R, S, stride, padding, dilation)
-    return N, C, D, H, W_in, K_out, T, R, S, O, P, Q
+    OD, P, Q = _out_dhw(D, H, W_in, T, R, S, stride, padding, dilation)
+    return N, C, D, H, W_in, K_out, T, R, S, OD, P, Q
 
 
 def _alloc_output(N, K_out, P, Q, x, layout):
@@ -61,10 +61,10 @@ def _alloc_output(N, K_out, P, Q, x, layout):
     return y
 
 
-def _alloc_output_3d(N, K_out, O, P, Q, x, layout):
+def _alloc_output_3d(N, K_out, OD, P, Q, x, layout):
     """Allocate the 3D output tensor: channels_last_3d for ndhwc, else
     contiguous NCDHW. Returned in logical NCDHW shape either way."""
-    y = torch.empty((N, K_out, O, P, Q), device=x.device, dtype=x.dtype)
+    y = torch.empty((N, K_out, OD, P, Q), device=x.device, dtype=x.dtype)
     if layout == "ndhwc":
         return y.to(memory_format=torch.channels_last_3d)
     return y
@@ -96,6 +96,11 @@ def _is_3x3_conv(R, S):
 def _is_3x3x3_conv(T, R, S):
     """Check if this is a 3x3x3 (depth x height x width) convolution."""
     return T == 3 and R == 3 and S == 3
+
+
+def _is_1x1x1_conv(T, R, S, dilation):
+    """Check if this is a 1x1x1 convolution (no spatial reduction in kernel)."""
+    return T == 1 and R == 1 and S == 1 and dilation == (1, 1, 1)
 
 
 def _is_winograd_eligible(R, S, stride, dilation, C=None):

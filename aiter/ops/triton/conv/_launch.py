@@ -21,6 +21,10 @@ from aiter.ops.triton._triton_kernels.conv.conv3d_general import (
     _conv3d_general_kernel,
     _get_config as _get_config_general_3d,
 )
+from aiter.ops.triton._triton_kernels.conv.conv3d_1x1x1 import (
+    _conv3d_1x1x1_kernel,
+    _get_config as _get_config_1x1x1_3d,
+)
 from aiter.ops.triton._triton_kernels.conv.conv_3x3 import (
     _conv2d_3x3_nhwc_kernel,
     _conv2d_3x3_cblocked_kernel,
@@ -591,7 +595,7 @@ def _launch_general_3d(
     T,
     R,
     S,
-    O,
+    OD,
     P,
     Q,
     K_pad,
@@ -608,7 +612,7 @@ def _launch_general_3d(
     pd, ph, pw = padding
     dd, dh, dw = dilation
 
-    M_total = N * O * P * Q
+    M_total = N * OD * P * Q
 
     shape_key = format_shape_key_3d(
         N=N,
@@ -646,7 +650,7 @@ def _launch_general_3d(
         T,
         R,
         S,
-        O,
+        OD,
         P,
         Q,
         K_pad,
@@ -659,6 +663,86 @@ def _launch_general_3d(
         dd,
         dh,
         dw,
+        M_total,
+        HAS_BIAS=bias_fp32 is not None,
+        ACTIVATION=activation,
+        LAYOUT=layout,
+        **config,
+    )
+
+
+def _launch_1x1x1_3d(
+    x,
+    w_oidhw,
+    bias_fp32,
+    y,
+    N,
+    C,
+    D,
+    H,
+    W_in,
+    K_out,
+    OD,
+    P,
+    Q,
+    stride,
+    padding,
+    activation,
+    layout="ncdhw",
+):
+    """Launch the specialized 1x1x1 conv3d kernel. stride/padding are 3-tuples
+    (depth, height, width); dilation is irrelevant for a 1x1x1 kernel.
+    ``layout`` is "ncdhw" or "ndhwc"."""
+    sd, sh, sw = stride
+    pd, ph, pw = padding
+
+    # W: [K_out, C, 1, 1, 1] -> [K_out, C]
+    w = w_oidhw.squeeze(-1).squeeze(-1).squeeze(-1).contiguous()
+
+    M_total = N * OD * P * Q
+
+    shape_key = format_shape_key_3d(
+        N=N,
+        C=C,
+        D=D,
+        H=H,
+        W=W_in,
+        K=K_out,
+        T=1,
+        R=1,
+        S=1,
+        sd=sd,
+        sh=sh,
+        sw=sw,
+        pd=pd,
+        ph=ph,
+        pw=pw,
+        dd=1,
+        dh=1,
+        dw=1,
+    )
+    config = _get_config_1x1x1_3d(shape_key=shape_key, M=M_total)
+
+    _conv3d_1x1x1_kernel[_make_mn_grid(M_total, K_out)](
+        x,
+        w,
+        bias_fp32,
+        y,
+        N,
+        C,
+        D,
+        H,
+        W_in,
+        K_out,
+        OD,
+        P,
+        Q,
+        sd,
+        sh,
+        sw,
+        pd,
+        ph,
+        pw,
         M_total,
         HAS_BIAS=bias_fp32 is not None,
         ACTIVATION=activation,

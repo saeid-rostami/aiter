@@ -7,7 +7,7 @@ on the Wan-style VAE encoder/decoder 3x3x3 shapes, reports per-shape latency
 and TFLOPS, and prints a correctness delta vs the fp32 reference.
 
 TFLOPS uses the universal direct-conv FLOP count
-    2 * N * K * C * T * R * S * O * P * Q
+    2 * N * K * C * T * R * S * OD * P * Q
 (same convention as bench_conv2d.py), so numbers are comparable across
 algorithms and against MIOpen.
 
@@ -24,7 +24,6 @@ import triton
 from aiter.ops.triton.conv._utils import _out_dhw
 from aiter.ops.triton.conv.conv3d import conv3d
 
-
 # (label, N, C, D, H, W, K), all 3x3x3 stride1 pad1. Encoder+decoder dedup to
 # these 4 distinct shapes; the call-count weights from the workload are noted.
 SHAPES = [
@@ -38,7 +37,7 @@ SHAPES = [
 def _bench_one(N, C, D, H, W, K, dtype, layout):
     T = R = S = 3
     stride = pad = dil = (1, 1, 1)
-    O, P, Q = _out_dhw(D, H, W, T, R, S, stride, pad, dil)
+    OD, P, Q = _out_dhw(D, H, W, T, R, S, stride, pad, dil)
 
     x = torch.randn(N, C, D, H, W, device="cuda", dtype=dtype)
     w = torch.randn(K, C, T, R, S, device="cuda", dtype=dtype)
@@ -48,22 +47,27 @@ def _bench_one(N, C, D, H, W, K, dtype, layout):
     # backends see the same memory layout.
     x_ref = x.to(memory_format=torch.channels_last_3d) if layout == "ndhwc" else x
 
-    tri = lambda: conv3d(x, w, b, stride=stride, padding=pad, dilation=dil, layout=layout)
-    ref = lambda: F.conv3d(x_ref, w, b, stride=stride, padding=pad, dilation=dil)
+    def tri():
+        return conv3d(x, w, b, stride=stride, padding=pad, dilation=dil, layout=layout)
+
+    def ref():
+        return F.conv3d(x_ref, w, b, stride=stride, padding=pad, dilation=dil)
 
     # Correctness vs fp32 reference.
     y = tri().float()
-    y_ref = F.conv3d(x.float(), w.float(), b.float(), stride=stride, padding=pad).float()
+    y_ref = F.conv3d(
+        x.float(), w.float(), b.float(), stride=stride, padding=pad
+    ).float()
     max_abs = (y - y_ref).abs().max().item()
     rel = max_abs / (y_ref.abs().max().item() + 1e-9)
 
     t_tri = triton.testing.do_bench(tri, warmup=25, rep=100)
     t_ref = triton.testing.do_bench(ref, warmup=25, rep=100)
 
-    flop = 2.0 * N * K * C * T * R * S * O * P * Q
+    flop = 2.0 * N * K * C * T * R * S * OD * P * Q
     tflops_tri = flop / (t_tri * 1e-3) / 1e12
     tflops_ref = flop / (t_ref * 1e-3) / 1e12
-    return (O, P, Q), t_tri, t_ref, tflops_tri, tflops_ref, rel
+    return (OD, P, Q), t_tri, t_ref, tflops_tri, tflops_ref, rel
 
 
 def main():
@@ -77,18 +81,18 @@ def main():
         raise SystemExit("CUDA not available")
 
     hdr = (
-        f"{'shape':34s} {'out(O,P,Q)':14s} {'Tri ms':>8s} {'Tor ms':>8s} "
+        f"{'shape':34s} {'out(OD,P,Q)':14s} {'Tri ms':>8s} {'Tor ms':>8s} "
         f"{'Tri TF':>7s} {'Tor TF':>7s} {'speedup':>8s} {'rel':>9s}"
     )
     print(f"\nconv3d general kernel — dtype={args.dtype} layout={args.layout}\n")
     print(hdr)
     print("-" * len(hdr))
     for label, N, C, D, H, W, K in SHAPES:
-        (O, P, Q), t_tri, t_ref, tf_tri, tf_ref, rel = _bench_one(
+        (OD, P, Q), t_tri, t_ref, tf_tri, tf_ref, rel = _bench_one(
             N, C, D, H, W, K, dtype, args.layout
         )
         print(
-            f"{label:34s} {f'{O},{P},{Q}':14s} {t_tri:8.3f} {t_ref:8.3f} "
+            f"{label:34s} {f'{OD},{P},{Q}':14s} {t_tri:8.3f} {t_ref:8.3f} "
             f"{tf_tri:7.1f} {tf_ref:7.1f} {t_ref / t_tri:7.2f}x {rel:9.2e}"
         )
     print()

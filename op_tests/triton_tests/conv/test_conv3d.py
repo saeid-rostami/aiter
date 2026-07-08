@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.conv.conv3d import conv3d
+from aiter.ops.triton.conv.conv3d import conv3d, _resolve_route, Route3D
 
 from ._helpers import ALL_SUPPORTED_ARCHS, dynamic_conv_tolerances
 
@@ -40,11 +40,14 @@ VAE_SHAPES = [
     ("vae_384_4x90x100", 1, 384, 4, 90, 100, 384),
 ]
 
-# (name, N, C, D, H, W, K, T, R, S, stride, pad, dil) — general-path coverage.
+# (name, N, C, D, H, W, K, T, R, S, stride, pad, dil) — covers both the general
+# path and the specialized 1x1x1 path (routing verified in test_routing).
 EXTRA_SHAPES = [
     ("stride2", 1, 32, 8, 32, 32, 32, 3, 3, 3, (2, 2, 2), (1, 1, 1), (1, 1, 1)),
     ("pad0", 1, 16, 6, 24, 24, 16, 3, 3, 3, (1, 1, 1), (0, 0, 0), (1, 1, 1)),
     ("k1x1x1", 1, 64, 4, 16, 16, 128, 1, 1, 1, (1, 1, 1), (0, 0, 0), (1, 1, 1)),
+    ("k1x1x1_proj", 1, 384, 3, 46, 51, 192, 1, 1, 1, (1, 1, 1), (0, 0, 0), (1, 1, 1)),
+    ("k1x1x1_s2", 1, 96, 6, 32, 32, 96, 1, 1, 1, (2, 2, 2), (0, 0, 0), (1, 1, 1)),
     ("k5x5x5", 1, 16, 8, 20, 20, 16, 5, 5, 5, (1, 1, 1), (2, 2, 2), (1, 1, 1)),
     ("dilated", 1, 16, 8, 24, 24, 16, 3, 3, 3, (1, 1, 1), (2, 2, 2), (2, 2, 2)),
 ]
@@ -52,8 +55,9 @@ EXTRA_SHAPES = [
 DTYPES = [(torch.float16, "fp16"), (torch.bfloat16, "bf16")]
 
 
-def _run_case(N, C, D, H, W, K, T, R, S, stride, pad, dil, dtype, bias, act,
-              layout="ncdhw"):
+def _run_case(
+    N, C, D, H, W, K, T, R, S, stride, pad, dil, dtype, bias, act, layout="ncdhw"
+):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
     torch.manual_seed(0)
@@ -61,8 +65,9 @@ def _run_case(N, C, D, H, W, K, T, R, S, stride, pad, dil, dtype, bias, act,
     w = torch.randn(K, C, T, R, S, device="cuda", dtype=dtype)
     b = torch.randn(K, device="cuda", dtype=dtype) if bias else None
 
-    y = conv3d(x, w, b, stride=stride, padding=pad, dilation=dil, activation=act,
-               layout=layout)
+    y = conv3d(
+        x, w, b, stride=stride, padding=pad, dilation=dil, activation=act, layout=layout
+    )
 
     ref = F.conv3d(
         x.float(),
@@ -90,9 +95,22 @@ LAYOUTS = ["ncdhw", "ndhwc"]
 def test_vae_shapes(shape, dtype, dtype_id, layout):
     _, N, C, D, H, W, K = shape
     _run_case(
-        N, C, D, H, W, K, 3, 3, 3,
-        (1, 1, 1), (1, 1, 1), (1, 1, 1),
-        dtype, bias=True, act="none", layout=layout,
+        N,
+        C,
+        D,
+        H,
+        W,
+        K,
+        3,
+        3,
+        3,
+        (1, 1, 1),
+        (1, 1, 1),
+        (1, 1, 1),
+        dtype,
+        bias=True,
+        act="none",
+        layout=layout,
     )
 
 
@@ -101,9 +119,22 @@ def test_vae_shapes(shape, dtype, dtype_id, layout):
 def test_vae_bias_and_relu(dtype, dtype_id, layout):
     # Smallest VAE shape, exercise the fused bias + relu epilogue.
     _run_case(
-        1, 384, 3, 46, 51, 384, 3, 3, 3,
-        (1, 1, 1), (1, 1, 1), (1, 1, 1),
-        dtype, bias=True, act="relu", layout=layout,
+        1,
+        384,
+        3,
+        46,
+        51,
+        384,
+        3,
+        3,
+        3,
+        (1, 1, 1),
+        (1, 1, 1),
+        (1, 1, 1),
+        dtype,
+        bias=True,
+        act="relu",
+        layout=layout,
     )
 
 
@@ -112,8 +143,33 @@ def test_vae_bias_and_relu(dtype, dtype_id, layout):
 @pytest.mark.parametrize("shape", EXTRA_SHAPES, ids=[s[0] for s in EXTRA_SHAPES])
 def test_extra_shapes(shape, dtype, dtype_id, layout):
     name, N, C, D, H, W, K, T, R, S, stride, pad, dil = shape
-    _run_case(N, C, D, H, W, K, T, R, S, stride, pad, dil, dtype, bias=False,
-              act="none", layout=layout)
+    _run_case(
+        N,
+        C,
+        D,
+        H,
+        W,
+        K,
+        T,
+        R,
+        S,
+        stride,
+        pad,
+        dil,
+        dtype,
+        bias=False,
+        act="none",
+        layout=layout,
+    )
+
+
+def test_routing():
+    # 1x1x1 -> specialized kernel; everything else -> general.
+    assert _resolve_route(1, 1, 1, (1, 1, 1)) is Route3D.ONE_X_ONE_X_ONE
+    assert _resolve_route(3, 3, 3, (1, 1, 1)) is Route3D.GENERAL
+    assert _resolve_route(5, 5, 5, (1, 1, 1)) is Route3D.GENERAL
+    # dilated 1x1x1 is degenerate but must not take the 1x1x1 path.
+    assert _resolve_route(1, 1, 1, (2, 2, 2)) is Route3D.GENERAL
 
 
 if __name__ == "__main__":
