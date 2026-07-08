@@ -25,6 +25,12 @@ from aiter.ops.triton._triton_kernels.conv.conv3d_1x1x1 import (
     _conv3d_1x1x1_kernel,
     _get_config as _get_config_1x1x1_3d,
 )
+from aiter.ops.triton._triton_kernels.conv.conv3d_3x3x3 import (
+    _conv3d_3x3x3_ndhwc_kernel,
+    _conv3d_3x3x3_cblocked_kernel,
+    _get_config_ndhwc as _get_config_3x3x3_ndhwc,
+    _get_config_cblocked as _get_config_3x3x3_cblocked,
+)
 from aiter.ops.triton._triton_kernels.conv.conv_3x3 import (
     _conv2d_3x3_nhwc_kernel,
     _conv2d_3x3_cblocked_kernel,
@@ -747,5 +753,167 @@ def _launch_1x1x1_3d(
         HAS_BIAS=bias_fp32 is not None,
         ACTIVATION=activation,
         LAYOUT=layout,
+        **config,
+    )
+
+
+def _launch_3x3x3_ndhwc(
+    x,
+    w_3x3x3,
+    bias_fp32,
+    y,
+    N,
+    C,
+    D,
+    H,
+    W_in,
+    K_out,
+    OD,
+    P,
+    Q,
+    C_pad,
+    stride,
+    padding,
+    dilation,
+    activation,
+):
+    """Launch the NDHWC-native 3x3x3 conv3d kernel (stride_c=1, stride_k=1)."""
+    sd, sh, sw = stride
+    pd, ph, pw = padding
+    dd, dh, dw = dilation
+
+    M_total = N * OD * P * Q
+
+    shape_key = format_shape_key_3d(
+        N=N,
+        C=C,
+        D=D,
+        H=H,
+        W=W_in,
+        K=K_out,
+        T=3,
+        R=3,
+        S=3,
+        sd=sd,
+        sh=sh,
+        sw=sw,
+        pd=pd,
+        ph=ph,
+        pw=pw,
+        dd=dd,
+        dh=dh,
+        dw=dw,
+    )
+    config = _get_config_3x3x3_ndhwc(shape_key=shape_key, M=M_total)
+
+    _conv3d_3x3x3_ndhwc_kernel[_make_mn_grid(M_total, K_out)](
+        x,
+        w_3x3x3,
+        bias_fp32,
+        y,
+        N,
+        C,
+        D,
+        H,
+        W_in,
+        K_out,
+        OD,
+        P,
+        Q,
+        C_pad,
+        sd,
+        sh,
+        sw,
+        pd,
+        ph,
+        pw,
+        dd,
+        dh,
+        dw,
+        M_total,
+        HAS_BIAS=bias_fp32 is not None,
+        ACTIVATION=activation,
+        **config,
+    )
+
+
+def _launch_3x3x3_cblocked(
+    x_blocked,
+    w_3x3x3,
+    bias_fp32,
+    y,
+    N,
+    C,
+    D,
+    H,
+    W_in,
+    K_out,
+    OD,
+    P,
+    Q,
+    C_pad,
+    Cb,
+    stride,
+    padding,
+    dilation,
+    activation,
+):
+    """Launch the 3x3x3 conv3d kernel for channel-blocked NCDHWc input."""
+    sd, sh, sw = stride
+    pd, ph, pw = padding
+    dd, dh, dw = dilation
+
+    M_total = N * OD * P * Q
+
+    shape_key = format_shape_key_3d(
+        N=N,
+        C=C,
+        D=D,
+        H=H,
+        W=W_in,
+        K=K_out,
+        T=3,
+        R=3,
+        S=3,
+        sd=sd,
+        sh=sh,
+        sw=sw,
+        pd=pd,
+        ph=ph,
+        pw=pw,
+        dd=dd,
+        dh=dh,
+        dw=dw,
+    )
+    config = _get_config_3x3x3_cblocked(shape_key=shape_key, M=M_total)
+
+    _conv3d_3x3x3_cblocked_kernel[_make_mn_grid(M_total, K_out)](
+        x_blocked,
+        w_3x3x3,
+        bias_fp32,
+        y,
+        N,
+        C,
+        D,
+        H,
+        W_in,
+        K_out,
+        OD,
+        P,
+        Q,
+        C_pad,
+        Cb,
+        sd,
+        sh,
+        sw,
+        pd,
+        ph,
+        pw,
+        dd,
+        dh,
+        dw,
+        M_total,
+        HAS_BIAS=bias_fp32 is not None,
+        ACTIVATION=activation,
         **config,
     )

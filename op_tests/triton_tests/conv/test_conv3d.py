@@ -164,12 +164,17 @@ def test_extra_shapes(shape, dtype, dtype_id, layout):
 
 
 def test_routing():
-    # 1x1x1 -> specialized kernel; everything else -> general.
-    assert _resolve_route(1, 1, 1, (1, 1, 1)) is Route3D.ONE_X_ONE_X_ONE
-    assert _resolve_route(3, 3, 3, (1, 1, 1)) is Route3D.GENERAL
-    assert _resolve_route(5, 5, 5, (1, 1, 1)) is Route3D.GENERAL
-    # dilated 1x1x1 is degenerate but must not take the 1x1x1 path.
-    assert _resolve_route(1, 1, 1, (2, 2, 2)) is Route3D.GENERAL
+    # 1x1x1 -> specialized channel-GEMM (layout-independent).
+    assert _resolve_route(1, 1, 1, (1, 1, 1), "ncdhw") is Route3D.ONE_X_ONE_X_ONE
+    assert _resolve_route(1, 1, 1, (1, 1, 1), "ndhwc") is Route3D.ONE_X_ONE_X_ONE
+    # 3x3x3 -> specialized kernel picked by layout.
+    assert _resolve_route(3, 3, 3, (1, 1, 1), "ncdhw") is Route3D.CBLOCKED_NCDHW
+    assert _resolve_route(3, 3, 3, (1, 1, 1), "ndhwc") is Route3D.NDHWC_3X3X3
+    # No specialized kernel -> general.
+    assert _resolve_route(5, 5, 5, (1, 1, 1), "ncdhw") is Route3D.GENERAL
+    # Dilated variants have no specialized kernel yet -> general.
+    assert _resolve_route(3, 3, 3, (2, 2, 2), "ncdhw") is Route3D.GENERAL
+    assert _resolve_route(1, 1, 1, (2, 2, 2), "ncdhw") is Route3D.GENERAL
 
 
 if __name__ == "__main__":

@@ -65,6 +65,7 @@ _PACK_CACHE = _LRUPackCache()
 _PACK_CACHE_3x3 = _LRUPackCache()
 _PACK_CACHE_WINOGRAD_F4X3 = _LRUPackCache()
 _PACK_CACHE_3D = _LRUPackCache()
+_PACK_CACHE_3x3x3 = _LRUPackCache()
 
 
 def prepack_oihw_to_kmajor(w_oihw: torch.Tensor, block_k: int = BLOCK_K):
@@ -128,6 +129,69 @@ def get_or_make_weight_pack_3d(w_oidhw: torch.Tensor, block_k: int = BLOCK_K):
     item = prepack_oidhw_to_kmajor(w_oidhw, block_k)
     _PACK_CACHE_3D.put(key, w_oidhw, item)
     return item
+
+
+def prepack_oidhw_to_3x3x3(w_oidhw: torch.Tensor, block_c: int = BLOCK_K):
+    """Pack a 3x3x3 weight ``[K_out, C, 3, 3, 3]`` as ``[K_out, 27, C_pad]`` for
+    the specialized 3x3x3 conv3d kernels.
+
+    The 27 taps are ordered ``trs = t*9 + r*3 + s`` (depth-major), which the
+    kernels index directly. Channels are padded to a multiple of ``block_c`` and
+    the trailing weight lanes zeroed so out-of-range channel loads contribute 0.
+    3D analogue of :func:`prepack_oihw_to_3x3`.
+    """
+    K_out, C, T, R, S = w_oidhw.shape
+    assert T == 3 and R == 3 and S == 3
+    C_pad = ((C + block_c - 1) // block_c) * block_c
+    # [K_out, C, 27] -> [K_out, 27, C]
+    w_trs = w_oidhw.reshape(K_out, C, 27).permute(0, 2, 1).contiguous()
+    if C_pad != C:
+        pad = torch.zeros(
+            (K_out, 27, C_pad - C), device=w_oidhw.device, dtype=w_oidhw.dtype
+        )
+        w_trs = torch.cat([w_trs, pad], dim=2)
+    return w_trs.contiguous(), C_pad
+
+
+def get_or_make_weight_pack_3x3x3(w_oidhw: torch.Tensor, block_c: int = BLOCK_K):
+    key = (
+        _storage_ptr(w_oidhw),
+        tuple(w_oidhw.shape),
+        w_oidhw.dtype,
+        block_c,
+    )
+    cached = _PACK_CACHE_3x3x3.get(key)
+    if cached is not None:
+        return cached[1]
+    item = prepack_oidhw_to_3x3x3(w_oidhw, block_c)
+    _PACK_CACHE_3x3x3.put(key, w_oidhw, item)
+    return item
+
+
+def prepack_ncdhw_to_cblocked(x: torch.Tensor, block_c: int = BLOCK_K):
+    """Pack NCDHW input into channel-blocked layout ``[N, C_blocks, D, H, W, Cb]``.
+
+    Within each block of ``Cb`` channels the data is contiguous (stride=1), so
+    the cblocked 3x3x3 kernel gets coalesced channel loads from an NCDHW source.
+    3D analogue of :func:`prepack_nchw_to_cblocked`.
+    """
+    N, C, D, H, W = x.shape
+    Cb = block_c
+    C_blocks = (C + Cb - 1) // Cb
+    C_pad = C_blocks * Cb
+
+    if C_pad != C:
+        x_padded = torch.zeros((N, C_pad, D, H, W), device=x.device, dtype=x.dtype)
+        x_padded[:, :C, :, :, :] = x
+    else:
+        x_padded = x
+
+    x_blocked = (
+        x_padded.reshape(N, C_blocks, Cb, D, H, W)
+        .permute(0, 1, 3, 4, 5, 2)
+        .contiguous()
+    )
+    return x_blocked, C_pad
 
 
 def prepack_oihw_to_3x3(w_oihw: torch.Tensor, block_c: int = BLOCK_K):
