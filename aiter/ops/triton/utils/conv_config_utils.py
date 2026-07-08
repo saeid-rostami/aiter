@@ -57,6 +57,36 @@ def format_shape_key(
     )
 
 
+def format_shape_key_3d(
+    N: int,
+    C: int,
+    D: int,
+    H: int,
+    W: int,
+    K: int,
+    T: int,
+    R: int,
+    S: int,
+    sd: int,
+    sh: int,
+    sw: int,
+    pd: int,
+    ph: int,
+    pw: int,
+    dd: int,
+    dh: int,
+    dw: int,
+) -> str:
+    """Canonical string key for a user-visible conv3d call. Same three-tier
+    lookup as :func:`format_shape_key` (2D), extended with the depth axis
+    (D, kernel T, stride/pad/dilation sd/pd/dd).
+    """
+    return (
+        f"N={N},C={C},D={D},H={H},W={W},K={K},T={T},R={R},S={S},"
+        f"sd={sd},sh={sh},sw={sw},pd={pd},ph={ph},pw={pw},dd={dd},dh={dh},dw={dw}"
+    )
+
+
 def _load_config_file(
     cache_dict: dict,
     cache_key: str,

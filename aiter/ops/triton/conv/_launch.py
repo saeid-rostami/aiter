@@ -5,7 +5,10 @@ import torch
 import triton
 
 from aiter.ops.triton.conv._utils import _out_hw, _is_winograd_eligible
-from aiter.ops.triton.utils.conv_config_utils import format_shape_key
+from aiter.ops.triton.utils.conv_config_utils import (
+    format_shape_key,
+    format_shape_key_3d,
+)
 from aiter.ops.triton._triton_kernels.conv.conv_1x1 import (
     _conv2d_1x1_kernel,
     _get_config as _get_config_1x1,
@@ -13,6 +16,10 @@ from aiter.ops.triton._triton_kernels.conv.conv_1x1 import (
 from aiter.ops.triton._triton_kernels.conv.conv_general import (
     _conv2d_general_kernel,
     _get_config as _get_config_general,
+)
+from aiter.ops.triton._triton_kernels.conv.conv3d_general import (
+    _conv3d_general_kernel,
+    _get_config as _get_config_general_3d,
 )
 from aiter.ops.triton._triton_kernels.conv.conv_3x3 import (
     _conv2d_3x3_nhwc_kernel,
@@ -567,4 +574,94 @@ def _launch_winograd_f4x3_cblocked(
         HAS_BIAS=bias_fp32 is not None,
         ACTIVATION=activation,
         **output_config,
+    )
+
+
+def _launch_general_3d(
+    x,
+    w_k,
+    bias_fp32,
+    y,
+    N,
+    C,
+    D,
+    H,
+    W_in,
+    K_out,
+    T,
+    R,
+    S,
+    O,
+    P,
+    Q,
+    K_pad,
+    stride,
+    padding,
+    dilation,
+    block_k,
+    activation,
+    layout="ncdhw",
+):
+    """Launch the general conv3d kernel. stride/padding/dilation are 3-tuples
+    (depth, height, width). ``layout`` is "ncdhw" or "ndhwc"."""
+    sd, sh, sw = stride
+    pd, ph, pw = padding
+    dd, dh, dw = dilation
+
+    M_total = N * O * P * Q
+
+    shape_key = format_shape_key_3d(
+        N=N,
+        C=C,
+        D=D,
+        H=H,
+        W=W_in,
+        K=K_out,
+        T=T,
+        R=R,
+        S=S,
+        sd=sd,
+        sh=sh,
+        sw=sw,
+        pd=pd,
+        ph=ph,
+        pw=pw,
+        dd=dd,
+        dh=dh,
+        dw=dw,
+    )
+    config = _get_config_general_3d(shape_key=shape_key, M=M_total)
+
+    _conv3d_general_kernel[_make_mn_grid(M_total, K_out)](
+        x,
+        w_k,
+        bias_fp32,
+        y,
+        N,
+        C,
+        D,
+        H,
+        W_in,
+        K_out,
+        T,
+        R,
+        S,
+        O,
+        P,
+        Q,
+        K_pad,
+        sd,
+        sh,
+        sw,
+        pd,
+        ph,
+        pw,
+        dd,
+        dh,
+        dw,
+        M_total,
+        HAS_BIAS=bias_fp32 is not None,
+        ACTIVATION=activation,
+        LAYOUT=layout,
+        **config,
     )

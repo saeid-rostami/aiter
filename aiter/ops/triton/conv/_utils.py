@@ -27,11 +27,46 @@ def _conv_dims(x, w_oihw, stride, padding, dilation):
     return N, C, H, W_in, K_out, R, S, P, Q
 
 
+def _out_dhw(D, H, W, T, R, S, stride, padding, dilation):
+    """3D output extent. `stride`/`padding`/`dilation` are 3-tuples (depth,
+    height, width)."""
+    sd, sh, sw = stride
+    pd, ph, pw = padding
+    dd, dh, dw = dilation
+    O = (D + 2 * pd - dd * (T - 1) - 1) // sd + 1
+    P = (H + 2 * ph - dh * (R - 1) - 1) // sh + 1
+    Q = (W + 2 * pw - dw * (S - 1) - 1) // sw + 1
+    return O, P, Q
+
+
+def _conv3d_dims(x, w_oidhw, stride, padding, dilation):
+    """3D counterpart of :func:`_conv_dims`: validate a NCDHW input against an
+    OIDHW weight and return the conv dimensions.
+
+    Weight is PyTorch-canonical ``[K_out, C, T, R, S]`` (T=depth tap).
+    """
+    assert x.is_cuda and w_oidhw.is_cuda
+    N, C, D, H, W_in = x.shape
+    K_out, Cw, T, R, S = w_oidhw.shape
+    assert Cw == C, f"weight in-channels {Cw} != input channels {C}"
+    O, P, Q = _out_dhw(D, H, W_in, T, R, S, stride, padding, dilation)
+    return N, C, D, H, W_in, K_out, T, R, S, O, P, Q
+
+
 def _alloc_output(N, K_out, P, Q, x, layout):
     """Allocate the output tensor, channels_last for nhwc else contiguous."""
     y = torch.empty((N, K_out, P, Q), device=x.device, dtype=x.dtype)
     if layout == "nhwc":
         return y.to(memory_format=torch.channels_last)
+    return y
+
+
+def _alloc_output_3d(N, K_out, O, P, Q, x, layout):
+    """Allocate the 3D output tensor: channels_last_3d for ndhwc, else
+    contiguous NCDHW. Returned in logical NCDHW shape either way."""
+    y = torch.empty((N, K_out, O, P, Q), device=x.device, dtype=x.dtype)
+    if layout == "ndhwc":
+        return y.to(memory_format=torch.channels_last_3d)
     return y
 
 
@@ -56,6 +91,11 @@ def _is_1x1_conv(R, S, dilation):
 def _is_3x3_conv(R, S):
     """Check if this is a 3x3 convolution."""
     return R == 3 and S == 3
+
+
+def _is_3x3x3_conv(T, R, S):
+    """Check if this is a 3x3x3 (depth x height x width) convolution."""
+    return T == 3 and R == 3 and S == 3
 
 
 def _is_winograd_eligible(R, S, stride, dilation, C=None):

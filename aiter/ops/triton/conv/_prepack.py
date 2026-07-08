@@ -64,6 +64,7 @@ class _LRUPackCache:
 _PACK_CACHE = _LRUPackCache()
 _PACK_CACHE_3x3 = _LRUPackCache()
 _PACK_CACHE_WINOGRAD_F4X3 = _LRUPackCache()
+_PACK_CACHE_3D = _LRUPackCache()
 
 
 def prepack_oihw_to_kmajor(w_oihw: torch.Tensor, block_k: int = BLOCK_K):
@@ -91,6 +92,41 @@ def get_or_make_weight_pack(w_oihw: torch.Tensor, block_k: int = BLOCK_K):
         return entry[1]
     item = prepack_oihw_to_kmajor(w_oihw, block_k)
     _PACK_CACHE.put(key, w_oihw, item)
+    return item
+
+
+def prepack_oidhw_to_kmajor(w_oidhw: torch.Tensor, block_k: int = BLOCK_K):
+    """Pack a 3D weight ``[K_out, C, T, R, S]`` into K-major ``[K_out, K_pad]``
+    for the general conv3d GEMM, where ``K_pad = pad(C*T*R*S, block_k)``.
+
+    The flatten order (C outermost, then T, R, S) must match the ``k ->
+    (c, t, r, s)`` decode in ``_conv3d_general_kernel``. Trailing padded lanes
+    are zero so any reduction step in the tail contributes 0.
+    """
+    K_out, C, T, R, S = w_oidhw.shape
+    K_red = C * T * R * S
+    K_pad = ((K_red + block_k - 1) // block_k) * block_k
+    w_flat = w_oidhw.reshape(K_out, K_red)
+    if K_pad != K_red:
+        pad = torch.zeros(
+            (K_out, K_pad - K_red), device=w_oidhw.device, dtype=w_oidhw.dtype
+        )
+        w_flat = torch.cat([w_flat, pad], dim=1)
+    return w_flat.contiguous(), K_pad
+
+
+def get_or_make_weight_pack_3d(w_oidhw: torch.Tensor, block_k: int = BLOCK_K):
+    key = (
+        _storage_ptr(w_oidhw),
+        tuple(w_oidhw.shape),
+        w_oidhw.dtype,
+        block_k,
+    )
+    entry = _PACK_CACHE_3D.get(key)
+    if entry is not None:
+        return entry[1]
+    item = prepack_oidhw_to_kmajor(w_oidhw, block_k)
+    _PACK_CACHE_3D.put(key, w_oidhw, item)
     return item
 
 
