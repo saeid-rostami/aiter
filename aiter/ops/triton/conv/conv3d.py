@@ -20,6 +20,7 @@ from aiter.ops.triton.conv._utils import (
     BLOCK_K,
     _conv3d_dims,
     _alloc_output_3d,
+    _ensure_layout_3d,
     _prep_bias,
     _is_1x1x1_conv,
     _is_3x3x3_conv,
@@ -150,8 +151,9 @@ def conv3d_general(
 ):
     """conv3d using the general im2col-free kernel with K-major prepacked
     weights. Handles any kernel size / stride / padding / dilation in either
-    layout. ``x`` is trusted to already carry the physical strides implied by
-    ``layout`` (the ``conv3d_ncdhw`` / ``conv3d_ndhwc`` wrappers normalize it)."""
+    layout. Safe to call directly: the input is forced into the physical layout
+    the kernel assumes (the kernel computes strides analytically)."""
+    x = _ensure_layout_3d(x, layout)
     N, C, D, H, W_in, K_out, T, R, S, OD, P, Q = _conv3d_dims(
         x, w_oidhw, stride, padding, dilation
     )
@@ -199,8 +201,9 @@ def conv3d_1x1x1(
     layout="ncdhw",
 ):
     """conv3d for 1x1x1 kernels — a pure channel-reduction GEMM. Raises
-    ValueError for non-1x1x1. ``x`` is trusted to carry the physical strides
-    implied by ``layout`` (the ncdhw/ndhwc wrappers normalize it)."""
+    ValueError for non-1x1x1. Safe to call directly: the input is forced into
+    the physical layout the kernel assumes."""
+    x = _ensure_layout_3d(x, layout)
     N, C, D, H, W_in, K_out, T, R, S, OD, P, Q = _conv3d_dims(
         x, w_oidhw, stride, padding, dilation
     )

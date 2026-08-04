@@ -70,6 +70,16 @@ def _alloc_output_3d(N, K_out, OD, P, Q, x, layout):
     return y
 
 
+def _ensure_layout_3d(x, layout):
+    """Force the physical memory layout the 3D kernels assume (they compute
+    strides analytically): contiguous NCDHW, or channels_last_3d for ndhwc.
+    A no-op when already in that layout. Semi-public entry points must call this
+    so they are safe on non-contiguous inputs (e.g. views/slices from a VAE)."""
+    if layout == "ndhwc":
+        return x.to(memory_format=torch.channels_last_3d)
+    return x.contiguous()
+
+
 def _prep_bias(bias):
     """Cast bias to contiguous fp32 for the kernels, or None when absent."""
     return bias.float().contiguous() if bias is not None else None
