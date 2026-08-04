@@ -17,8 +17,12 @@ import os
 from collections import OrderedDict
 
 import torch
+import triton
 
-from aiter.ops.triton.conv._utils import BLOCK_K, _storage_ptr
+from aiter.ops.triton._triton_kernels.conv.helpers import CONV_AUTOTUNE_ENABLED
+from aiter.ops.triton._triton_kernels.conv.prepack import _nchw_to_cblocked_kernel
+from aiter.ops.triton.conv._utils import BLOCK_K
+from aiter.ops.triton.utils.conv_config_utils import has_conv_config
 
 _DEFAULT_PACK_CACHE_MAXSIZE = 256
 
@@ -67,6 +71,20 @@ _PACK_CACHE_3x3 = _LRUPackCache()
 _PACK_CACHE_WINOGRAD_F4X3 = _LRUPackCache()
 
 
+def _pack_cache_key(w: torch.Tensor, block: int) -> tuple:
+    """Identity for a packed weight, including aliases and in-place updates."""
+    return (
+        w.data_ptr(),
+        w.device.type,
+        w.device.index,
+        tuple(w.shape),
+        tuple(w.stride()),
+        w.dtype,
+        w._version,
+        block,
+    )
+
+
 def prepack_oihw_to_kmajor(w_oihw: torch.Tensor, block_k: int = BLOCK_K):
     K_out, C, R, S = w_oihw.shape
     K_red = C * R * S
@@ -81,12 +99,7 @@ def prepack_oihw_to_kmajor(w_oihw: torch.Tensor, block_k: int = BLOCK_K):
 
 
 def get_or_make_weight_pack(w_oihw: torch.Tensor, block_k: int = BLOCK_K):
-    key = (
-        _storage_ptr(w_oihw),
-        tuple(w_oihw.shape),
-        w_oihw.dtype,
-        block_k,
-    )
+    key = _pack_cache_key(w_oihw, block_k)
     entry = _PACK_CACHE.get(key)
     if entry is not None:
         return entry[1]
@@ -110,12 +123,7 @@ def prepack_oihw_to_3x3(w_oihw: torch.Tensor, block_c: int = BLOCK_K):
 
 
 def get_or_make_weight_pack_3x3(w_oihw: torch.Tensor, block_c: int = BLOCK_K):
-    key = (
-        _storage_ptr(w_oihw),
-        tuple(w_oihw.shape),
-        w_oihw.dtype,
-        block_c,
-    )
+    key = _pack_cache_key(w_oihw, block_c)
     cached = _PACK_CACHE_3x3.get(key)
     if cached is not None:
         return cached[1]
@@ -124,26 +132,98 @@ def get_or_make_weight_pack_3x3(w_oihw: torch.Tensor, block_c: int = BLOCK_K):
     return item
 
 
-def prepack_nchw_to_cblocked(x: torch.Tensor, block_c: int = BLOCK_K):
-    """Pack NCHW input into channel-blocked layout [N, C_blocks, H, W, Cb].
+_NCHW_DIRECT_MIN_PIXELS = 512
+
+
+def _nchw_direct_is_profitable(N: int, H: int, W: int) -> bool:
+    """Use direct NCHW only where it was tuned or autotuning is active."""
+    return N * H * W >= _NCHW_DIRECT_MIN_PIXELS and (
+        CONV_AUTOTUNE_ENABLED or has_conv_config("CONV-3X3-NCHW")
+    )
+
+
+def is_nchw_direct_input(x_blocked: torch.Tensor) -> bool:
+    """A 4-D tensor is the original NCHW activation; a pack is 5-D NCHWc."""
+    return x_blocked.ndim == 4
+
+
+def materialize_nchw_to_cblocked(x: torch.Tensor, block_c: int = BLOCK_K):
+    """Materialize NCHW as [N, C_blocks, H, W, Cb] in one Triton pass.
 
     Within each block of Cb channels, data is contiguous (stride=1).
     """
+    if not x.is_contiguous():
+        x = x.contiguous()
     N, C, H, W = x.shape
     Cb = block_c
     C_blocks = (C + Cb - 1) // Cb
     C_pad = C_blocks * Cb
 
-    if C_pad != C:
-        x_padded = torch.zeros((N, C_pad, H, W), device=x.device, dtype=x.dtype)
-        x_padded[:, :C, :, :] = x
+    x_blocked = torch.empty(
+        (N, C_blocks, H, W, Cb), device=x.device, dtype=x.dtype
+    )
+    grid = lambda meta: (
+        triton.cdiv(H * W, meta["BLOCK_M"]),
+        triton.cdiv(C_pad, meta["BLOCK_C"]),
+        N,
+    )
+    if CONV_AUTOTUNE_ENABLED:
+        config = {}
+    elif C <= 4:
+        config = {
+            "BLOCK_C": 32,
+            "BLOCK_M": 32,
+            "num_warps": 4,
+            "num_stages": 1,
+        }
+    elif H * W <= 256 and C >= 64:
+        config = {
+            "BLOCK_C": 64,
+            "BLOCK_M": 32,
+            "num_warps": 4,
+            "num_stages": 1,
+        }
+    elif H * W <= 4096:
+        config = {
+            "BLOCK_C": 32,
+            "BLOCK_M": 64,
+            "num_warps": 4,
+            "num_stages": 1,
+        }
     else:
-        x_padded = x
-
-    x_blocked = (
-        x_padded.reshape(N, C_blocks, Cb, H, W).permute(0, 1, 3, 4, 2).contiguous()
+        config = {
+            "BLOCK_C": 32,
+            "BLOCK_M": 128,
+            "num_warps": 8,
+            "num_stages": 1,
+            "waves_per_eu": 2,
+        }
+    _nchw_to_cblocked_kernel[grid](
+        x,
+        x_blocked,
+        C,
+        H * W,
+        C_PAD=C_pad,
+        CB=Cb,
+        **config,
     )
     return x_blocked, C_pad
+
+
+def prepack_nchw_to_cblocked(x: torch.Tensor, block_c: int = BLOCK_K):
+    """Choose direct NCHW or the fused materialized NCHWc fallback.
+
+    Large inputs stay as their original 4-D contiguous NCHW tensor. The direct
+    kernel masks the weight-side channel padding and uses the real NCHW batch
+    stride, so even non-block-aligned channel counts need no padded copy.
+    """
+    if not x.is_contiguous():
+        x = x.contiguous()
+    N, C, H, W = x.shape
+    C_pad = triton.cdiv(C, block_c) * block_c
+    if _nchw_direct_is_profitable(N, H, W):
+        return x, C_pad
+    return materialize_nchw_to_cblocked(x, block_c)
 
 
 def prepack_winograd_filter_f4x3(w_oihw: torch.Tensor, block_c: int = BLOCK_K):
@@ -178,12 +258,7 @@ def prepack_winograd_filter_f4x3(w_oihw: torch.Tensor, block_c: int = BLOCK_K):
 
 
 def get_or_make_winograd_filter_f4x3(w_oihw: torch.Tensor, block_c: int = BLOCK_K):
-    key = (
-        _storage_ptr(w_oihw),
-        tuple(w_oihw.shape),
-        w_oihw.dtype,
-        block_c,
-    )
+    key = _pack_cache_key(w_oihw, block_c)
     cached = _PACK_CACHE_WINOGRAD_F4X3.get(key)
     if cached is not None:
         return cached[1]
