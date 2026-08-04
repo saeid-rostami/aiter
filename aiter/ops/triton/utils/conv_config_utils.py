@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import copy
 import functools
 import json
 import os
@@ -117,6 +116,21 @@ def _get_conv_config_cached(
     )
 
 
+@functools.lru_cache(maxsize=64 if USE_LRU_CACHE else 0)
+def has_conv_config(config_name: str) -> bool:
+    """Whether a tuning table for ``config_name`` ships for the running arch.
+
+    Some kernels are optional routes: they only run where their JSON table has
+    actually been measured, and the router falls back to an always-tuned
+    kernel elsewhere (see ``CONV-3X3-NCHW`` in conv/DESIGN.md §5.3a). Callers
+    use this to make that routing decision *before* ``get_conv_config`` would
+    raise on the missing file — it is an availability probe, not a source of
+    tuning values.
+    """
+    dev = arch_info.get_arch()
+    return os.path.exists(f"{AITER_TRITON_CONFIGS_PATH}/conv/{dev}-{config_name}.json")
+
+
 def get_conv_config(
     config_name: str,
     shape_key: str | None = None,
@@ -130,10 +144,15 @@ def get_conv_config(
            kernels, T for Winograd).
         3. ``"any"`` — global fallback.
 
-    Returns a fresh deep-copy of the config dict; safe to mutate.
+    Returns a fresh copy of the config dict; safe to mutate.
+
+    The copy is shallow: a conv config entry is a flat mapping of scalar tuning
+    values (``BLOCK_M``/``BLOCK_N``/``BLOCK_K``/``GROUP_SIZE_M``/``num_warps``/
+    ``num_stages``), so a shallow copy is equivalent to a deep one here and
+    keeps this off the per-call hot path.
 
     Modeled on :func:`get_gemm_config` but with conv-native (shape-key first)
     dispatch and no splitk / N=K= specialization.
     """
     config = _get_conv_config_cached(config_name, shape_key, M)
-    return copy.deepcopy(config)
+    return dict(config)

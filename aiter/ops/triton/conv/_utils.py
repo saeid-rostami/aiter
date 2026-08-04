@@ -28,16 +28,35 @@ def _conv_dims(x, w_oihw, stride, padding, dilation):
 
 
 def _alloc_output(N, K_out, P, Q, x, layout):
-    """Allocate the output tensor, channels_last for nhwc else contiguous."""
-    y = torch.empty((N, K_out, P, Q), device=x.device, dtype=x.dtype)
+    """Allocate the output tensor, channels_last for nhwc else contiguous.
+
+    The nhwc buffer is allocated directly in channels_last. Going through
+    ``torch.empty(...).to(memory_format=...)`` instead would allocate a second
+    buffer and launch a full strided transposing copy of uninitialized memory
+    before the kernel ever writes to it.
+    """
     if layout == "nhwc":
-        return y.to(memory_format=torch.channels_last)
-    return y
+        return torch.empty(
+            (N, K_out, P, Q),
+            device=x.device,
+            dtype=x.dtype,
+            memory_format=torch.channels_last,
+        )
+    return torch.empty((N, K_out, P, Q), device=x.device, dtype=x.dtype)
 
 
 def _prep_bias(bias):
-    """Cast bias to contiguous fp32 for the kernels, or None when absent."""
-    return bias.float().contiguous() if bias is not None else None
+    """Hand the bias to the kernels in its native dtype, or None when absent.
+
+    The kernels index ``BIAS + offs_n``, so the only requirement is a unit
+    innermost stride; the fp16/bf16 -> fp32 promotion happens in the epilogue,
+    where it is exact and free. Casting on the host instead would add a whole
+    extra GPU dispatch per conv call for a K-element tensor that is a caller-
+    owned, loop-invariant ``nn.Conv2d`` parameter.
+    """
+    if bias is None:
+        return None
+    return bias if bias.stride(0) == 1 else bias.contiguous()
 
 
 def _storage_ptr(t: torch.Tensor) -> int:

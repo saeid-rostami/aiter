@@ -160,7 +160,7 @@ def _conv2d_general_kernel(
 
     # Epilogue: bias + activation + store
     if HAS_BIAS:
-        b = tl.load(BIAS + offs_n, mask=offs_n < K_out, other=0.0)
+        b = tl.load(BIAS + offs_n, mask=offs_n < K_out, other=0.0).to(tl.float32)
         acc += b[None, :]
 
     if ACTIVATION == "relu":

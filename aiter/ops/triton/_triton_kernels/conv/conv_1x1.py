@@ -148,7 +148,7 @@ def _conv2d_1x1_kernel(
 
     # Bias
     if HAS_BIAS:
-        b = tl.load(BIAS + offs_n, mask=kout_mask, other=0.0)
+        b = tl.load(BIAS + offs_n, mask=kout_mask, other=0.0).to(tl.float32)
         acc += b[None, :]
 
     # Activation

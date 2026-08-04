@@ -19,6 +19,7 @@ from collections import OrderedDict
 import torch
 
 from aiter.ops.triton.conv._utils import BLOCK_K, _storage_ptr
+from aiter.ops.triton.utils.conv_config_utils import has_conv_config
 
 _DEFAULT_PACK_CACHE_MAXSIZE = 256
 
@@ -124,21 +125,89 @@ def get_or_make_weight_pack_3x3(w_oihw: torch.Tensor, block_c: int = BLOCK_K):
     return item
 
 
-def prepack_nchw_to_cblocked(x: torch.Tensor, block_c: int = BLOCK_K):
-    """Pack NCHW input into channel-blocked layout [N, C_blocks, H, W, Cb].
+# Minimum input pixel count (N*H*W) at which the 3x3 NCHW-direct kernel is used
+# instead of materializing an NCHWc pack. Measured on gfx1201 (see
+# conv/DESIGN.md §5.3a): the direct kernel's channel-strided tile loads do not
+# vectorize, which costs ~30% of kernel-only throughput on tiny spatial maps
+# (N*H*W <= 196: 49x49 and 14x14 ResNet tails) but is far cheaper than the full
+# extra read+write pass of the pack once the activation is large. The measured
+# crossover sits between N*H*W = 196 (direct loses) and 784 (direct wins).
+_NCHW_DIRECT_MIN_PIXELS = 512
 
-    Within each block of Cb channels, data is contiguous (stride=1).
+
+def _nchw_direct_is_profitable(N: int, H: int, W: int) -> bool:
+    """Whether the 3x3 NCHW-direct kernel should read the activation in place
+    instead of paying for a materialized NCHWc pack.
+
+    Two conditions, both routing decisions rather than tuning values:
+
+    * the activation is large enough for the saved pass to outweigh the
+      direct kernel's channel-strided loads (see the constant above), and
+    * a ``CONV-3X3-NCHW`` tuning table ships for the running arch. The table
+      is only measured on the arch it was swept on; where it is absent the
+      router degrades to the materialized pack + ``CONV-3X3-CBLOCKED``, which
+      is tuned everywhere. Without this probe the missing file would raise
+      inside ``get_conv_config`` instead of falling back.
+    """
+    return N * H * W >= _NCHW_DIRECT_MIN_PIXELS and has_conv_config("CONV-3X3-NCHW")
+
+
+def is_nchw_direct_view(x_blocked: torch.Tensor) -> bool:
+    """True when ``x_blocked`` is the zero-copy NCHW *view* produced by
+    :func:`prepack_nchw_to_cblocked` rather than a materialized NCHWc pack.
+
+    The view carries the channel axis on the outer stride (``H*W``); a real
+    NCHWc pack always has ``stride(-1) == 1``. When ``H*W == 1`` the two
+    layouts are bit-identical, so mis-classifying that degenerate case is
+    harmless.
+    """
+    return x_blocked.stride(-1) != 1
+
+
+def prepack_nchw_to_cblocked(x: torch.Tensor, block_c: int = BLOCK_K):
+    """Present an NCHW input as [N, C_blocks, H, W, Cb] for the 3x3 kernels.
+
+    Two representations share one return contract — both have shape
+    ``[N, C_blocks, H, W, Cb]`` with ``C_blocks * Cb == C_pad``, and
+    ``.contiguous()`` on either yields the identical channel-blocked buffer:
+
+    * **Zero-copy NCHW view** (large activations). ``as_strided`` re-expresses
+      the caller's NCHW tensor with the channel axis split into
+      ``(C_blocks, Cb)`` and moved last. Nothing is copied; the 3x3 NCHW-direct
+      kernel reads the original activation in place. This removes an entire
+      read+write pass over the activation on every call — the input pack is the
+      one repack that cannot be cached, since the activation changes per call.
+    * **Materialized NCHWc pack** (small activations). The original behaviour:
+      channels are physically gathered so each pixel carries ``Cb`` contiguous
+      channels, which is what ``_conv2d_3x3_cblocked_kernel`` and the Winograd
+      cblocked input transform want.
+
+    Callers that need real NCHWc storage (the Winograd cblocked path) call
+    ``.contiguous()`` on the result; see ``_launch_winograd_f4x3_cblocked``.
     """
     N, C, H, W = x.shape
     Cb = block_c
     C_blocks = (C + Cb - 1) // Cb
     C_pad = C_blocks * Cb
 
+    if not x.is_contiguous():
+        x = x.contiguous()
+
     if C_pad != C:
+        # The channel tail is zeroed (not left uninitialized) so that
+        # `.contiguous()` on the view below reproduces the materialized pack
+        # exactly, for consumers that do not mask on `c < C`.
         x_padded = torch.zeros((N, C_pad, H, W), device=x.device, dtype=x.dtype)
         x_padded[:, :C, :, :] = x
     else:
         x_padded = x
+
+    if _nchw_direct_is_profitable(N, H, W):
+        x_view = x_padded.as_strided(
+            (N, C_blocks, H, W, Cb),
+            (C_pad * H * W, Cb * H * W, W, 1, H * W),
+        )
+        return x_view, C_pad
 
     x_blocked = (
         x_padded.reshape(N, C_blocks, Cb, H, W).permute(0, 1, 3, 4, 2).contiguous()

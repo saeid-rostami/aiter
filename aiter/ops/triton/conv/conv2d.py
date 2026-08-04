@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import logging
 from enum import Enum
 
 import torch
@@ -58,7 +59,12 @@ def _resolve_route(R, S, stride, dilation, N, C, H, W_in, K_out, layout):
             # "cblocked" pick falls through to the NHWC 3x3 kernel.
             if method in ("winograd_f4x3", "winograd_f4x3_cblocked"):
                 return Route.WF4X3
+            # "general" (the narrow-C rule) is deliberately NOT honoured here:
+            # it was measured on the NCHW kernels only, and the NHWC kernel
+            # keeps its own layout-native path.
             return Route.NHWC_3X3
+        if method == "general":
+            return Route.GENERAL
         if method == "winograd_f4x3_cblocked":
             return Route.WF4X3_CBLOCKED
         if method == "winograd_f4x3":
@@ -102,12 +108,15 @@ def conv2d(
     if layout not in ("nchw", "nhwc"):
         raise ValueError(f"layout must be 'nchw' or 'nhwc', got '{layout}'")
 
-    _LOGGER.info(
-        f"CONV2D: x={tuple(x.shape)} w={tuple(w_oihw.shape)} stride={stride} "
-        f"padding={padding} dilation={dilation} layout={layout} "
-        f"dtype={x.dtype} bias={'yes' if bias is not None else 'no'} "
-        f"act={activation}"
-    )
+    # Guard the f-string: at the default WARNING level this message is thrown
+    # away, but building it costs ~1us on every conv call.
+    if _LOGGER.get_logger().isEnabledFor(logging.INFO):
+        _LOGGER.info(
+            f"CONV2D: x={tuple(x.shape)} w={tuple(w_oihw.shape)} stride={stride} "
+            f"padding={padding} dilation={dilation} layout={layout} "
+            f"dtype={x.dtype} bias={'yes' if bias is not None else 'no'} "
+            f"act={activation}"
+        )
 
     if layout == "nhwc":
         return conv2d_nhwc(x, w_oihw, bias, stride, padding, dilation, activation)
@@ -131,12 +140,12 @@ def conv2d_winograd_f4x3(
     _require_winograd_eligible("conv2d_winograd_f4x3", R, S, stride, dilation, C)
 
     y = _alloc_output(N, K_out, P, Q, x, layout)
-    bias_fp32 = _prep_bias(bias)
+    bias = _prep_bias(bias)
     U, C_pad = get_or_make_winograd_filter_f4x3(w_oihw.contiguous(), block_k)
     _launch_winograd_f4x3(
         x,
         U,
-        bias_fp32,
+        bias,
         y,
         N,
         C,
@@ -176,7 +185,7 @@ def conv2d_winograd_f4x3_cblocked(
     )
 
     y = _alloc_output(N, K_out, P, Q, x, "nchw")
-    bias_fp32 = _prep_bias(bias)
+    bias = _prep_bias(bias)
     U, C_pad = get_or_make_winograd_filter_f4x3(w_oihw.contiguous(), block_k)
     if x_blocked is None:
         x_blocked, C_pad_blocked = prepack_nchw_to_cblocked(x, block_k)
@@ -186,7 +195,7 @@ def conv2d_winograd_f4x3_cblocked(
         x_blocked,
         C_pad_blocked,
         U,
-        bias_fp32,
+        bias,
         y,
         N,
         C,
@@ -220,11 +229,11 @@ def conv2d_1x1(
         raise ValueError(f"conv2d_1x1 requires 1x1 kernel, got {R}x{S}")
 
     y = _alloc_output(N, K_out, P, Q, x, layout)
-    bias_fp32 = _prep_bias(bias)
+    bias = _prep_bias(bias)
     _launch_1x1(
         x,
         w_oihw.contiguous(),
-        bias_fp32,
+        bias,
         y,
         N,
         C,
@@ -256,12 +265,12 @@ def conv2d_general(
     N, C, H, W_in, K_out, R, S, P, Q = _conv_dims(x, w_oihw, stride, padding, dilation)
 
     y = _alloc_output(N, K_out, P, Q, x, layout)
-    bias_fp32 = _prep_bias(bias)
+    bias = _prep_bias(bias)
     w_k, K_pad = get_or_make_weight_pack(w_oihw.contiguous(), block_k)
     _launch_general(
         x,
         w_k,
-        bias_fp32,
+        bias,
         y,
         N,
         C,
@@ -299,12 +308,12 @@ def conv2d_nhwc_3x3(
         raise ValueError(f"conv2d_nhwc_3x3 requires 3x3 kernel, got {R}x{S}")
 
     y = _alloc_output(N, K_out, P, Q, x, "nhwc")
-    bias_fp32 = _prep_bias(bias)
+    bias = _prep_bias(bias)
     w_3x3, C_pad = get_or_make_weight_pack_3x3(w_oihw.contiguous(), block_k)
     _launch_3x3_nhwc(
         x,
         w_3x3,
-        bias_fp32,
+        bias,
         y,
         N,
         C,
@@ -459,7 +468,7 @@ def conv2d_nchw_cblocked(
         raise ValueError(f"conv2d_nchw_cblocked requires 3x3 kernel, got {R}x{S}")
 
     y = _alloc_output(N, K_out, P, Q, x, "nchw")
-    bias_fp32 = _prep_bias(bias)
+    bias = _prep_bias(bias)
     w_3x3, C_pad = get_or_make_weight_pack_3x3(w_oihw.contiguous(), block_k)
     if x_blocked is None:
         # input channel-block size matches the weight padding block
@@ -473,7 +482,7 @@ def conv2d_nchw_cblocked(
     _launch_3x3_cblocked(
         x_blocked,
         w_3x3,
-        bias_fp32,
+        bias,
         y,
         N,
         C,

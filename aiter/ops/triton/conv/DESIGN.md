@@ -116,7 +116,8 @@ aiter/ops/triton/_triton_kernels/conv/
                        aiter/ops/triton/configs/conv/, loaded via
                        aiter/ops/triton/utils/conv_config_utils.py.
   conv_1x1.py          1×1 GEMM kernel (NCHW + NHWC via LAYOUT constexpr)
-  conv_3x3.py          3×3 NHWC kernel + 3×3 cblocked (NCHWc) kernel
+  conv_3x3.py          3×3 NHWC kernel, 3×3 cblocked (NCHWc) kernel and
+                       3×3 NCHW-direct kernel (no input repack)
   conv_general.py      K-major reduction with on-the-fly (c, r, s) decoding
   conv_3x3_winograd_f4x3.py
                        4 kernels: input transform (NCHW & NHWC), cblocked input
@@ -179,7 +180,10 @@ Only 3×3 has a real choice — 1×1 always uses the 1×1 kernel, 5×5/7×7 alwa
 fall to `general`. For 3×3, `_launch.py:_select_3x3_method` decides:
 
 ```python
-def _select_3x3_method(N, C, H, W, K_out, stride, dilation):
+def _select_3x3_method(N, C, H, W, K_out, stride, dilation, block_c=BLOCK_K):
+    # 0) Narrower than one channel block -> general (NCHW router only)
+    if C < block_c:
+        return "general"
     # 1) Non-Winograd-eligible (stride>1, dilation>1, or C<4) -> cblocked
     if not _is_winograd_eligible(3, 3, stride, dilation, C):
         return "cblocked"
@@ -195,7 +199,29 @@ def _select_3x3_method(N, C, H, W, K_out, stride, dilation):
     return "cblocked"
 ```
 
-The thresholds (`C/K ≥ 512`, `T ≥ 98`, `T ≥ 392`) come from a sweep on
+Rule 0 is not a swept threshold — it is the exact condition under which the
+channel pad is non-empty. All three 3×3 kernels consume a weight packed to
+`C_pad = ceil(C / block_c) * block_c` and reduce over that padded extent, so at
+`C < block_c` most of the `tl.dot` reduction lanes are masked-out padding:
+`C = 3` with `block_c = 64` does 21× the necessary MACs. `conv_general` decodes
+`(c, r, s)` on the fly against the true `C` and has no such amplification.
+Measured on gfx1201 (fp16, 3×3, pad 1), NCHW route vs `conv_general`:
+
+| shape | 3×3 NCHW | general | gain |
+|---|---|---|---|
+| `(1,3,512,512) → 128` (FLUX/SD VAE first layer) | 374.4 µs | 158.9 µs | 2.36× |
+| `(1,32,64,64) → 512` (FLUX L13) | 48.7 µs | 33.6 µs | 1.45× |
+| `(1,512,64,64) → 64` (`K < block_c`, for contrast) | 72.2 µs | 65.3 µs | 1.11× |
+| `(1,128,512,512) → 3` (`K = 3`, for contrast) | 515.7 µs | 490.4 µs | 1.05× |
+
+Only the **C** side is routed. The last two rows are the symmetric `K_out`
+pad-amplification case, and the measurement says `conv_general` does *not*
+meaningfully fix it (it pads `K_out` to `BLOCK_N` in exactly the same way), so
+no `K` rule is added — a narrow-`K` win needs a kernel change, not a route
+change. `_resolve_route` also drops rule 0 on the NHWC path: it was measured on
+the NCHW kernels only, and NHWC keeps its layout-native 3×3 kernel.
+
+The Winograd thresholds (`C/K ≥ 512`, `T ≥ 98`, `T ≥ 392`) come from a sweep on
 RDNA4 — see the comment block in `_launch.py`. Two implications worth knowing:
 
 1. **The router uses padding `(1,1)` regardless of the caller's padding.** The
@@ -337,6 +363,78 @@ kernel+repack number in the bench includes the per-batch input repack;
 the user-facing `conv2d_nchw` calls `get_or_make_input_pack_cblocked`, which
 caches by `(storage_ptr, shape, dtype, ...)` so back-to-back calls with the
 same input tensor only repack once.
+
+### 5.3a `_conv2d_3x3_nchw_kernel` — the repack-free NCHW path
+
+The cblocked kernel above buys coalesced channel loads by paying, **on every
+call**, for a full extra read+write pass over the activation. Unlike the three
+weight packs, that pack can never be cached: the activation is a fresh
+intermediate tensor each call. On the diffusion-VAE shapes it was measured at
+~21% of the NCHW wall time.
+
+`_conv2d_3x3_nchw_kernel` removes it by reading the caller's NCHW tensor in
+place. The trick is to **transpose the GEMM**:
+
+```
+cblocked :  acc[m, k_out] = sum_c  X[n, cblk, ih, iw, c_local] * W3[k_out, rs, c]
+NCHW     :  acc[k_out, m] = sum_c  W3[k_out, rs, c] * X[n, c, ih, iw]
+```
+
+Reading NCHW into the `[BLOCK_M, BLOCK_K]` (pixel-major) orientation the
+cblocked kernel uses would put the channel — stride `H·W` in NCHW — on the fast
+axis, i.e. one scattered 2-byte load per lane. Loading the tile as
+`[BLOCK_K, BLOCK_M]` instead puts the *pixel* axis (unit stride along `W`) on
+the fast axis, so a wavefront walks consecutive addresses. The weight tile
+`W3[K_out, 9, C_pad]` is already `c`-contiguous, so it is the natural `A`
+operand of the transposed dot. And because NCHW output is `q`-contiguous, the
+`[BLOCK_N, BLOCK_M]` accumulator stores back coalesced — no second transpose.
+
+Channel padding is *not* materialized on the input side: the reduction masks on
+`k_offs < C`, so channels `>= C` are never touched even though the weight side
+is padded to `C_pad`.
+
+**`ROW_ALIGNED`.** When `BLOCK_M` divides `Q` a tile cannot straddle an output
+row, so `n` and `p` are uniform across the tile and `q` is a plain
+`tl.arange`. The kernel then skips the `//` / `%` row decode entirely, which
+also lets the compiler *prove* the input and output addresses are unit-stride
+along the fast axis and widen the per-lane 2-byte accesses into vector
+accesses. It further makes `M_total` an exact multiple of `BLOCK_M`, so the row
+mask drops out. This is a **legality** test computed in `_launch_3x3_nchw`
+(`Q % BLOCK_M == 0`), not a tuning knob — it never appears in the JSON.
+
+**Where each path runs.** `prepack_nchw_to_cblocked` decides, on
+`N·H·W >= _NCHW_DIRECT_MIN_PIXELS` (512) **and** on the running arch shipping a
+`CONV-3X3-NCHW` tuning table (see §Tuning) — an arch without one keeps the
+cblocked path unchanged:
+
+- **≥ 512 pixels → zero-copy NCHW view** (`as_strided` to
+  `[N, C_blocks, H, W, Cb]` with the channel axis left on the outer stride) →
+  `_conv2d_3x3_nchw_kernel`. Nothing is copied.
+- **< 512 pixels → materialized NCHWc pack** → `_conv2d_3x3_cblocked_kernel`,
+  exactly as before.
+
+The threshold is measured, not guessed. The direct kernel's channel-strided
+tile loads do not vectorize as well as the cblocked kernel's, costing roughly
+10% of kernel-only throughput on average and up to ~35% on tiny spatial maps —
+but that is small next to a whole extra pass over the activation once the
+activation is big. On gfx1201 the crossover is sharp and sits between
+`N·H·W = 196` (ResNet-50's 14×14 / 7×7 tails, where the direct kernel loses
+30–40%) and `N·H·W = 784` (28×28, where it wins). Everything in the
+diffusion-VAE shape set is far above it.
+
+Both representations share one return contract — shape `[N, C_blocks, H, W, Cb]`
+with `C_blocks * Cb == C_pad`, and `.contiguous()` on either yields the
+identical channel-blocked buffer. That is what lets the Winograd cblocked input
+transform, which needs real NCHWc storage, recover it with a single
+`.contiguous()` in `_launch_winograd_f4x3_cblocked` at exactly the old cost. It
+is also why the channel tail is zero-filled rather than left uninitialized when
+`C_pad != C`, even though this kernel would mask it away.
+
+**Note on the reported route label.** `_resolve_route` still labels this shape
+class `_conv2d_3x3_cblocked_kernel`; the NCHW-direct dispatch happens one level
+down, in `_launch_3x3_cblocked`. The bench's per-layer "Triton Kernel" column
+therefore still says `cblocked` for layers that actually ran the NCHW-direct
+kernel. Renaming the `Route` member is a follow-up.
 
 ### 5.4 `_conv2d_general_kernel`
 
@@ -523,7 +621,8 @@ input:
 |---|---|---|---|
 | `[K_out, K_pad]` (K-major weight) | `general` | `_prepack.py:prepack_oihw_to_kmajor` | LRU 256, `_PACK_CACHE` |
 | `[K_out, 9, C_pad]` (3×3 weight) | `3x3_nhwc`, `3x3_cblocked` | `prepack_oihw_to_3x3` | LRU 256, `_PACK_CACHE_3x3` |
-| `[N, C_blocks, H, W, Cb]` (NCHWc input, `Cb=64`) | `3x3_cblocked`, `winograd_f4x3_cblocked` (input transform) | `prepack_nchw_to_cblocked` | **Single-entry dict** by design |
+| `[N, C_blocks, H, W, Cb]` (NCHWc input, `Cb=64`) | `3x3_cblocked`, `winograd_f4x3_cblocked` (input transform) | `prepack_nchw_to_cblocked` | **Not cached** — see below |
+| `[N, C_pad, H, W]` (plain NCHW, read in place) | `3x3_nchw` | none — `prepack_nchw_to_cblocked` returns a zero-copy `as_strided` view | n/a, nothing is built |
 | `[36, K_out, C_pad]` (Winograd weight) | `winograd_f4x3_*` | `prepack_winograd_filter_f4x3` | LRU 256, `_PACK_CACHE_WINOGRAD_F4X3` |
 
 ### Why three weight caches are LRU but the input cache is single-entry
@@ -644,6 +743,19 @@ kernel launch. Each builds a `shape_key`
   `N` differs) matches nothing in Tier 1. It does not error — it falls to the
   `M_LEQ_<n>` bucket for its row count, or ultimately to `"any"`. Slightly
   less optimal, still correct.
+
+`CONV-3X3-NCHW` (the repack-free NCHW kernel, §5.3a) is the newest table, and
+the only **optional** one: it ships for `gfx1201`, the arch its sweep was
+measured on, and for no other. Rather than seed the other archs with
+carried-over numbers, the route itself is conditional —
+`_nchw_direct_is_profitable` asks `has_conv_config("CONV-3X3-NCHW")`
+(`conv_config_utils.py`) and, when the arch has no table, returns the
+materialized NCHWc pack so the always-tuned `CONV-3X3-CBLOCKED` path runs
+exactly as it did before. The three-tier
+literal → `M_LEQ_<n>` → `"any"` walk only ever applies *within* a table that
+exists; a missing table is a routing fact, not a lookup miss. Add
+`gfx<arch>-CONV-3X3-NCHW.json` to switch an arch onto the direct kernel — no
+Python change is needed.
 
 This tiered fallback is why tuning only the **deduped** shape set is safe:
 identical shapes need tuning once, and any unseen shape degrades gracefully

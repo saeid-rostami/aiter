@@ -9,8 +9,8 @@
 [![Triton](https://img.shields.io/badge/Triton-3.7-orange.svg)](https://github.com/triton-lang/triton)
 
 A hand-written Triton 2-D convolution library optimized for AMD RDNA
-GPUs. Five kernel families (1×1, 3×3 cblocked, 3×3 NHWC, Winograd
-F(4×4, 3×3), general) behind one shape-driven router and one entry
+GPUs. Six kernel families (1×1, 3×3 NCHW-direct, 3×3 cblocked, 3×3 NHWC,
+Winograd F(4×4, 3×3), general) behind one shape-driven router and one entry
 point. Drop-in for the forward path of `nn.Conv2d`.
 
 ---
@@ -33,7 +33,7 @@ no NHWC↔NCHW conversion), and gets reasonable performance across the
 full matrix **without per-architecture kernel implementations** (one
 set of Triton kernels for every arch, with a thin per-arch JSON config
 layer — see Tuning). A shape-driven
-router picks between five kernel families (1×1, 3×3 cblocked, 3×3 NHWC,
+router picks between six kernel families (1×1, 3×3 NCHW-direct, 3×3 cblocked, 3×3 NHWC,
 Winograd F(4×4, 3×3), general) so the right kernel runs per layer
 automatically. Some kernels do repack inputs/weights into kernel-local
 formats (channel-blocked tiles for cblocked, G/Bᵀ transforms for
@@ -92,15 +92,35 @@ y = conv2d(
 )
 ```
 
-A shape-driven router picks one of five kernel families:
+A shape-driven router picks one of six kernel families:
 
 | Family | When it runs |
 |---|---|
 | 1×1 GEMM | `R==1, S==1` |
-| 3×3 cblocked (NCHW) | 3×3, channel-blocked input for coalesced loads |
+| 3×3 NCHW-direct | 3×3 NCHW below the Winograd threshold with `N·H·W ≥ 512`, on an arch that ships a `CONV-3X3-NCHW` config — reads the caller's NCHW activation in place, **no input repack** |
+| 3×3 cblocked (NCHW) | the same case with `N·H·W < 512` — small activations, where a channel-blocked input pack still pays for itself |
 | 3×3 NHWC | 3×3 with channels-last input — no input repack |
 | Winograd F(4×4, 3×3) | 3×3, stride=1, dilation=1, `C ≥ 512`, `K ≥ 512`, enough output tiles |
-| General | anything not 1×1 or 3×3 (5×5, 7×7, dilated, strided) |
+| General | anything not 1×1 or 3×3 (5×5, 7×7, dilated, strided), **and** NCHW 3×3 with `C < 64` (narrower than one channel block — see below) |
+
+**Narrow-`C` 3×3 goes to the general kernel.** Every 3×3 kernel packs its
+weight to `C_pad = ceil(C/64)·64` and reduces over that padded extent, so a
+`C < 64` layer burns most of its `tl.dot` lanes on masked padding.
+`_select_3x3_method` sends those NCHW shapes to `conv_general`, which decodes
+`(c, r, s)` against the true `C`. Measured on gfx1201 (fp16, pad 1):
+`C=3 (1,3,512,512)→128` 374 µs → 159 µs, `C=32 (1,32,64,64)→512` 48.7 µs →
+33.6 µs. At `C ≥ 64` the pad is empty and the 3×3 kernels win, so the rule
+stops there. NHWC keeps its layout-native 3×3 kernel — the rule was not
+measured on that path.
+
+The NCHW-direct / cblocked split is made inside `prepack_nchw_to_cblocked`
+(`_prepack.py`), which returns either a zero-copy NCHW *view* or a materialized
+NCHWc pack; `_launch_3x3_cblocked` dispatches on which one it got. Both are
+shaped `[N, C_blocks, H, W, Cb]`, so the wrapper contract is unchanged and
+`.contiguous()` on either yields the same buffer. The direct route is enabled
+per-arch by the presence of `configs/conv/<arch>-CONV-3X3-NCHW.json` (measured
+on `gfx1201`); archs without it keep the cblocked path bit-for-bit. See
+DESIGN.md §5.3a.
 
 ### Use as `nn.Conv2d` drop-in
 
@@ -240,12 +260,12 @@ in `_triton_kernels/conv/conv_*.py` for the current process.
 aiter/ops/triton/conv/                Kernel library
   conv2d.py                           Public API + smart routing
   _launch.py                          Grid setup + _select_3x3_method
-  _prepack.py                         Weight repack caches (LRU) + input packer
+  _prepack.py                         Weight repack caches (LRU) + input packer/NCHW view
   _utils.py                           Shape math, eligibility predicates
   README.md, DESIGN.md
 
 aiter/ops/triton/_triton_kernels/conv/   @triton.jit kernels
-  (1x1, 3x3 cblocked, 3x3 NHWC, general, 5 Winograd kernels)
+  (1x1, 3x3 NCHW-direct, 3x3 cblocked, 3x3 NHWC, general, 5 Winograd kernels)
 
 op_tests/triton_tests/conv/           Pytest unit tests (CI-collected; skipped on unsupported archs)
   test_conv2d.py                      The only collected test file
