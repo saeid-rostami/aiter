@@ -75,6 +75,18 @@ def _load_config_file(
     return False
 
 
+def _conv_config_path(config_name: str) -> str:
+    dev = arch_info.get_arch()
+    return f"{AITER_TRITON_CONFIGS_PATH}/conv/{dev}-{config_name}.json"
+
+
+@functools.lru_cache(maxsize=64 if USE_LRU_CACHE else 0)
+def _get_conv_config_file_cached(config_name: str) -> dict:
+    cache = {}
+    _load_config_file(cache, config_name, _conv_config_path(config_name))
+    return cache[config_name]
+
+
 @functools.lru_cache(maxsize=512 if USE_LRU_CACHE else 0)
 def _get_conv_config_cached(
     config_name: str,
@@ -83,22 +95,8 @@ def _get_conv_config_cached(
     variants: tuple[str, ...],
 ) -> dict:
     """Config walk: variant shape entries, generic shape, M bucket, any."""
-    if not hasattr(_get_conv_config_cached, "_file_cache"):
-        _get_conv_config_cached._file_cache = {}
-
     dev = arch_info.get_arch()
-    file_cache_key = f"{dev}_{config_name}"
-
-    if file_cache_key not in _get_conv_config_cached._file_cache:
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/conv/{dev}-{config_name}.json"
-        _load_config_file(
-            _get_conv_config_cached._file_cache,
-            file_cache_key,
-            fpath,
-            fpath_should_exist=True,
-        )
-
-    config_dict = _get_conv_config_cached._file_cache[file_cache_key]
+    config_dict = _get_conv_config_file_cached(config_name)
 
     # Tier 1: optional layout/dtype-specific exact-shape pins.
     if shape_key is not None:
@@ -132,8 +130,18 @@ def _get_conv_config_cached(
 @functools.lru_cache(maxsize=64 if USE_LRU_CACHE else 0)
 def has_conv_config(config_name: str) -> bool:
     """Return whether the running architecture ships this optional table."""
-    dev = arch_info.get_arch()
-    return os.path.exists(f"{AITER_TRITON_CONFIGS_PATH}/conv/{dev}-{config_name}.json")
+    return os.path.exists(_conv_config_path(config_name))
+
+
+def conv_config_uses_exact_routes(config_name: str) -> bool:
+    """Return whether routing is restricted to exact shape entries."""
+    return bool(_get_conv_config_file_cached(config_name).get("route_exact_only"))
+
+
+def has_exact_conv_config(config_name: str, shape_key: str) -> bool:
+    """Return whether a config has an exact generic shape entry."""
+    config_dict = _get_conv_config_file_cached(config_name)
+    return shape_key in config_dict.get("shapes", {})
 
 
 def get_conv_config(
