@@ -8,6 +8,17 @@ import torch
 BLOCK_K = 64
 
 
+def _winograd_transform_storage_dtype(dtype: torch.dtype) -> torch.dtype:
+    """Storage dtype for Winograd-domain operands.
+
+    BF16 inputs are transformed in FP32, then kept in FP16 for the matrix
+    multiply.  FP16 has three more mantissa bits than BF16 at the same storage
+    size, which limits F(4,3) transform-rounding error while retaining FP32
+    accumulation.  Native FP16 inputs remain FP16.
+    """
+    return torch.float16 if dtype == torch.bfloat16 else dtype
+
+
 def _out_hw(H, W, R, S, stride, padding, dilation):
     sh, sw = stride
     ph, pw = padding

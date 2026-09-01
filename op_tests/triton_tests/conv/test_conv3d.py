@@ -26,6 +26,8 @@ from aiter.ops.triton.conv.conv3d import (
     _resolve_route,
     Route3D,
 )
+from aiter.ops.triton.conv._prepack import prepack_winograd_hw_filter_f4x3
+from aiter.ops.triton.conv._utils import _winograd_transform_storage_dtype
 
 from ._helpers import (
     ALL_SUPPORTED_ARCHS,
@@ -201,6 +203,36 @@ def test_winograd_variants(wino_fn, dtype, dtype_id):
         ref = F.conv3d(x.float(), w.float(), b.float(), stride=1, padding=1)
         rtol, atol = _winograd_tolerances(dtype, C * 27)
         torch.testing.assert_close(y.float(), ref, rtol=rtol, atol=atol)
+
+
+def test_bf16_winograd_uses_fp16_transform_storage():
+    """BF16 I/O uses FP16 Winograd operands to avoid a second BF16 rounding."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    assert _winograd_transform_storage_dtype(torch.bfloat16) == torch.float16
+    assert _winograd_transform_storage_dtype(torch.float16) == torch.float16
+
+    torch.manual_seed(0)
+    N, C, D, H, W, K = 1, 96, 4, 32, 40, 96
+    x = torch.randn(N, C, D, H, W, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(K, C, 3, 3, 3, device="cuda", dtype=torch.bfloat16) * 0.1
+    b = torch.randn(K, device="cuda", dtype=torch.bfloat16)
+
+    transformed_w, _ = prepack_winograd_hw_filter_f4x3(w)
+    assert transformed_w.dtype == torch.float16
+    assert torch.isfinite(transformed_w).all()
+
+    y = conv3d_winograd_hw_f4x3(x, w, b, padding=(1, 1, 1))
+    ref = F.conv3d(x.float(), w.float(), b.float(), padding=1)
+    error = (y.float() - ref).abs()
+    normalized_max_error = error.max() / ref.abs().max()
+    relative_l2_error = torch.linalg.vector_norm(error) / torch.linalg.vector_norm(ref)
+
+    assert y.dtype == torch.bfloat16
+    assert torch.isfinite(y).all()
+    assert normalized_max_error < 0.015
+    assert relative_l2_error < 0.006
 
 
 def test_routing():

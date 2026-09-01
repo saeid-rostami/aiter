@@ -4,7 +4,11 @@
 import torch
 import triton
 
-from aiter.ops.triton.conv._utils import _out_hw, _is_winograd_eligible
+from aiter.ops.triton.conv._utils import (
+    _out_hw,
+    _is_winograd_eligible,
+    _winograd_transform_storage_dtype,
+)
 from aiter.ops.triton.utils.conv_config_utils import (
     format_shape_key,
     format_shape_key_3d,
@@ -963,8 +967,8 @@ def _launch_winograd_hw_f4x3(
 
     cblocked = x_blocked is not None
     x_in = x_blocked if cblocked else x
-    input_dtype = x_in.dtype
-    V = torch.empty((36, T_v, C_pad), device=x_in.device, dtype=input_dtype)
+    transform_dtype = _winograd_transform_storage_dtype(x_in.dtype)
+    V = torch.empty((36, T_v, C_pad), device=x_in.device, dtype=transform_dtype)
     M = torch.empty((36, T_out, K_out), device=x_in.device, dtype=torch.float32)
 
     shape_key = format_shape_key_3d(

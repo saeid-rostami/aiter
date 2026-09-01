@@ -17,7 +17,11 @@ import os
 from collections import OrderedDict
 import torch
 
-from aiter.ops.triton.conv._utils import BLOCK_K, _storage_ptr
+from aiter.ops.triton.conv._utils import (
+    BLOCK_K,
+    _storage_ptr,
+    _winograd_transform_storage_dtype,
+)
 
 _DEFAULT_PACK_CACHE_MAXSIZE = 256
 
@@ -283,7 +287,8 @@ def prepack_winograd_hw_filter_f4x3(w_oidhw: torch.Tensor, block_c: int = BLOCK_
     Applies the 2D F(4,3) filter transform ``G g Gᵀ`` to each of the 3 depth
     slices of a 3x3x3 weight ``[K_out, C, 3, 3, 3]``, producing
     ``U[3, 36, K_out, C_pad]`` (tap-major). Runs once per weight in fp32, then
-    cast to the activation dtype. 3D-depth analogue of
+    casts to the Winograd operand dtype (fp16 for both fp16 and bf16 inputs).
+    3D-depth analogue of
     :func:`prepack_winograd_filter_f4x3`.
     """
     K_out, C, T, R, S = w_oidhw.shape
@@ -310,7 +315,8 @@ def prepack_winograd_hw_filter_f4x3(w_oidhw: torch.Tensor, block_c: int = BLOCK_
             (3, 36, K_out, C_pad - C), device=w_oidhw.device, dtype=torch.float32
         )
         u = torch.cat([u, pad], dim=3)
-    return u.to(w_oidhw.dtype).contiguous(), C_pad
+    storage_dtype = _winograd_transform_storage_dtype(w_oidhw.dtype)
+    return u.to(storage_dtype).contiguous(), C_pad
 
 
 def get_or_make_winograd_hw_filter_f4x3(w_oidhw: torch.Tensor, block_c: int = BLOCK_K):
